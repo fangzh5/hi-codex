@@ -1,0 +1,41 @@
+﻿[package]
+name = "hicodex"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight Windows taskbar meter for Codex usage limits"
+license = "MIT"
+repository = "https://github.com/fangzh5/hi-codex"
+readme = "README.md"
+keywords = ["codex", "windows", "taskbar", "usage"]
+categories = ["gui"]
+
+[dependencies]
+serde_json = "1.0"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

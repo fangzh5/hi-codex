@@ -1,0 +1,8 @@
+/target/
+/dist/
+*.log
+*.pdb
+Thumbs.db
+Desktop.ini
+.DS_Store
+/release/
