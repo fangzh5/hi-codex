@@ -28,7 +28,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{WM_MOUSEHOVER, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    TrackMouseEvent, TME_HOVER, TME_LEAVE, TRACKMOUSEEVENT,
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_HOVER, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -66,7 +66,8 @@ const MENU_REFRESH: i32 = 1001;
 const MENU_OPEN_USAGE: i32 = 1002;
 const MENU_STARTUP: i32 = 1003;
 const MENU_CENTER_TASKBAR: i32 = 1004;
-const MENU_EXIT: i32 = 1005;
+const MENU_ACRYLIC_TASKBAR: i32 = 1005;
+const MENU_EXIT: i32 = 1006;
 
 static STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -77,6 +78,7 @@ static HOVER_TICKS: AtomicU32 = AtomicU32::new(0);
 static OUTSIDE_TICKS: AtomicU32 = AtomicU32::new(0);
 static HOVER_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CENTERED: AtomicBool = AtomicBool::new(false);
+static TASKBAR_ACRYLIC: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -392,6 +394,9 @@ unsafe fn render_widget_layered(hwnd: HWND) {
     let byte_count = (width * height * 4) as usize;
     std::ptr::write_bytes(output_bits, 0, byte_count);
     let output = std::slice::from_raw_parts_mut(output_bits as *mut u8, byte_count);
+    for pixel in output.chunks_exact_mut(4) {
+        pixel[3] = 1;
+    }
 
     let dpi = GetDpiForWindow(hwnd).max(96);
     let label_font = create_widget_font(dpi, 15, FW_SEMIBOLD);
@@ -1136,6 +1141,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let open_usage = wide("Open Usage dashboard");
     let startup_label = wide("Start with Windows");
     let center_taskbar_label = wide("Center taskbar icons");
+    let acrylic_taskbar_label = wide("Acrylic taskbar");
     let exit = wide("Exit HiCodex");
 
     AppendMenuW(menu, MF_STRING, MENU_REFRESH as usize, refresh.as_ptr());
@@ -1162,6 +1168,17 @@ unsafe fn show_context_menu(hwnd: HWND) {
             },
         MENU_CENTER_TASKBAR as usize,
         center_taskbar_label.as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING
+            | if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
+                MF_CHECKED
+            } else {
+                0
+            },
+        MENU_ACRYLIC_TASKBAR as usize,
+        acrylic_taskbar_label.as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, MENU_EXIT as usize, exit.as_ptr());
@@ -1195,6 +1212,19 @@ unsafe fn show_context_menu(hwnd: HWND) {
             } else if taskbar::set_preference(false).is_ok() {
                 TASKBAR_CENTERED.store(false, Ordering::Release);
                 taskbar::restore_left();
+            }
+        }
+        MENU_ACRYLIC_TASKBAR => {
+            let enabled = !TASKBAR_ACRYLIC.load(Ordering::Acquire);
+            if enabled {
+                if taskbar::apply_acrylic() && taskbar::set_acrylic_preference(true).is_ok() {
+                    TASKBAR_ACRYLIC.store(true, Ordering::Release);
+                } else {
+                    taskbar::restore_acrylic();
+                }
+            } else if taskbar::set_acrylic_preference(false).is_ok() {
+                TASKBAR_ACRYLIC.store(false, Ordering::Release);
+                taskbar::restore_acrylic();
             }
         }
         MENU_EXIT => {
@@ -1232,6 +1262,7 @@ unsafe extern "system" fn widget_window_proc(
             0
         }
         WM_RBUTTONDOWN => {
+            SetCapture(hwnd);
             HOVER_SUPPRESSED.store(true, Ordering::Release);
             HOVER_TICKS.store(0, Ordering::Relaxed);
             OUTSIDE_TICKS.store(0, Ordering::Relaxed);
@@ -1242,6 +1273,7 @@ unsafe extern "system" fn widget_window_proc(
             0
         }
         WM_RBUTTONUP => {
+            ReleaseCapture();
             show_context_menu(hwnd);
             0
         }
@@ -1249,6 +1281,9 @@ unsafe extern "system" fn widget_window_proc(
             position_widget(hwnd);
             if TASKBAR_CENTERED.load(Ordering::Acquire) {
                 taskbar::apply_centered();
+            }
+            if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
+                taskbar::apply_acrylic();
             }
             0
         }
@@ -1269,6 +1304,9 @@ unsafe extern "system" fn widget_window_proc(
             if TASKBAR_CENTERED.load(Ordering::Acquire) {
                 taskbar::apply_centered();
             }
+            if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
+                taskbar::apply_acrylic();
+            }
             0
         }
         WM_REFRESHED => {
@@ -1281,10 +1319,14 @@ unsafe extern "system" fn widget_window_proc(
             if TASKBAR_CENTERED.load(Ordering::Acquire) {
                 taskbar::apply_centered();
             }
+            if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
+                taskbar::apply_acrylic();
+            }
             0
         }
         WM_DESTROY => {
             taskbar::restore_left();
+            taskbar::restore_acrylic();
             let flyout = FLYOUT_WINDOW.swap(0, Ordering::AcqRel);
             if flyout != 0 {
                 DestroyWindow(flyout);
@@ -1349,6 +1391,7 @@ unsafe fn register_window_class(
 pub fn run() {
     STATE.get_or_init(|| Arc::new(Mutex::new(AppState::default())));
     TASKBAR_CENTERED.store(taskbar::preference_enabled(), Ordering::Release);
+    TASKBAR_ACRYLIC.store(taskbar::acrylic_preference_enabled(), Ordering::Release);
 
     unsafe {
         taskbar::initialize();
@@ -1409,6 +1452,9 @@ pub fn run() {
         position_widget(hwnd);
         if TASKBAR_CENTERED.load(Ordering::Acquire) {
             taskbar::apply_centered();
+        }
+        if TASKBAR_ACRYLIC.load(Ordering::Acquire) && !taskbar::apply_acrylic() {
+            TASKBAR_ACRYLIC.store(false, Ordering::Release);
         }
         trigger_refresh();
         #[cfg(debug_assertions)]

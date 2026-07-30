@@ -1,12 +1,14 @@
 use std::ffi::c_void;
-use std::mem::{transmute, zeroed};
+use std::mem::{size_of, transmute, zeroed};
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::AccessibleObjectFromWindow;
@@ -17,9 +19,37 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const SETTINGS_KEY: &str = r"HKCU\Software\HiCodex";
 const CENTER_VALUE: &str = "CenterTaskbarIcons";
+const ACRYLIC_VALUE: &str = "AcrylicTaskbar";
 const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
+const WCA_ACCENT_POLICY: i32 = 19;
+const ACCENT_DISABLED: i32 = 0;
+const ACCENT_ENABLE_BLUR_BEHIND: i32 = 3;
+const ACCENT_ENABLE_ACRYLIC_BLUR_BEHIND: i32 = 4;
+const TASKBAR_ACRYLIC_TINT: u32 = 0x9028_2220;
 
 static COM_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static ORIGINAL_TASKBAR_POLICIES: OnceLock<Mutex<Vec<(HWND, AccentPolicy)>>> = OnceLock::new();
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AccentPolicy {
+    state: i32,
+    flags: i32,
+    gradient_color: u32,
+    animation_id: i32,
+}
+
+#[repr(C)]
+struct WindowCompositionAttributeData {
+    attribute: i32,
+    data: *mut c_void,
+    size: usize,
+}
+
+type SetWindowCompositionAttributeFn =
+    unsafe extern "system" fn(HWND, *mut WindowCompositionAttributeData) -> i32;
+type GetWindowCompositionAttributeFn =
+    unsafe extern "system" fn(HWND, *mut WindowCompositionAttributeData) -> i32;
 
 type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
 type GetChildCountFn = unsafe extern "system" fn(*mut c_void, *mut i32) -> i32;
@@ -36,9 +66,9 @@ fn reg_command() -> Command {
     command
 }
 
-pub fn preference_enabled() -> bool {
+fn preference_enabled_for(name: &str) -> bool {
     reg_command()
-        .args(["query", SETTINGS_KEY, "/v", CENTER_VALUE])
+        .args(["query", SETTINGS_KEY, "/v", name])
         .output()
         .map(|output| {
             output.status.success()
@@ -49,14 +79,14 @@ pub fn preference_enabled() -> bool {
         .unwrap_or(false)
 }
 
-pub fn set_preference(enabled: bool) -> Result<(), String> {
+fn set_preference_for(name: &str, enabled: bool) -> Result<(), String> {
     let value = if enabled { "1" } else { "0" };
     let status = reg_command()
         .args([
             "add",
             SETTINGS_KEY,
             "/v",
-            CENTER_VALUE,
+            name,
             "/t",
             "REG_DWORD",
             "/d",
@@ -73,6 +103,22 @@ pub fn set_preference(enabled: bool) -> Result<(), String> {
     }
 }
 
+pub fn preference_enabled() -> bool {
+    preference_enabled_for(CENTER_VALUE)
+}
+
+pub fn set_preference(enabled: bool) -> Result<(), String> {
+    set_preference_for(CENTER_VALUE, enabled)
+}
+
+pub fn acrylic_preference_enabled() -> bool {
+    preference_enabled_for(ACRYLIC_VALUE)
+}
+
+pub fn set_acrylic_preference(enabled: bool) -> Result<(), String> {
+    set_preference_for(ACRYLIC_VALUE, enabled)
+}
+
 pub unsafe fn initialize() {
     let result = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
     if result >= 0 {
@@ -84,6 +130,128 @@ pub unsafe fn shutdown() {
     if COM_INITIALIZED.swap(false, Ordering::AcqRel) {
         CoUninitialize();
     }
+}
+
+unsafe fn composition_functions() -> Option<(
+    SetWindowCompositionAttributeFn,
+    GetWindowCompositionAttributeFn,
+)> {
+    let user32 = GetModuleHandleW(wide("user32.dll").as_ptr());
+    if user32 == 0 {
+        return None;
+    }
+
+    let set = GetProcAddress(user32, c"SetWindowCompositionAttribute".as_ptr().cast())?;
+    let get = GetProcAddress(user32, c"GetWindowCompositionAttribute".as_ptr().cast())?;
+    Some((
+        transmute::<unsafe extern "system" fn() -> isize, SetWindowCompositionAttributeFn>(set),
+        transmute::<unsafe extern "system" fn() -> isize, GetWindowCompositionAttributeFn>(get),
+    ))
+}
+
+unsafe fn taskbar_windows() -> Vec<HWND> {
+    let mut windows = Vec::new();
+    let primary = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+    if primary != 0 {
+        windows.push(primary);
+    }
+
+    let secondary_class = wide("Shell_SecondaryTrayWnd");
+    let mut after = 0;
+    loop {
+        let window = FindWindowExW(0, after, secondary_class.as_ptr(), null());
+        if window == 0 {
+            break;
+        }
+        windows.push(window);
+        after = window;
+    }
+    windows
+}
+
+unsafe fn read_accent_policy(
+    hwnd: HWND,
+    get: GetWindowCompositionAttributeFn,
+) -> Option<AccentPolicy> {
+    let mut policy = AccentPolicy {
+        state: ACCENT_DISABLED,
+        flags: 0,
+        gradient_color: 0,
+        animation_id: 0,
+    };
+    let mut data = WindowCompositionAttributeData {
+        attribute: WCA_ACCENT_POLICY,
+        data: &mut policy as *mut _ as *mut c_void,
+        size: size_of::<AccentPolicy>(),
+    };
+    (get(hwnd, &mut data) != 0).then_some(policy)
+}
+
+unsafe fn write_accent_policy(
+    hwnd: HWND,
+    set: SetWindowCompositionAttributeFn,
+    policy: &mut AccentPolicy,
+) -> bool {
+    let mut data = WindowCompositionAttributeData {
+        attribute: WCA_ACCENT_POLICY,
+        data: policy as *mut _ as *mut c_void,
+        size: size_of::<AccentPolicy>(),
+    };
+    set(hwnd, &mut data) != 0
+}
+
+pub unsafe fn apply_acrylic() -> bool {
+    let Some((set, get)) = composition_functions() else {
+        return false;
+    };
+    let originals = ORIGINAL_TASKBAR_POLICIES.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut originals) = originals.lock() else {
+        return false;
+    };
+
+    let mut applied = false;
+    for hwnd in taskbar_windows() {
+        if !originals.iter().any(|(saved, _)| *saved == hwnd) {
+            let original = read_accent_policy(hwnd, get).unwrap_or(AccentPolicy {
+                state: ACCENT_DISABLED,
+                flags: 0,
+                gradient_color: 0,
+                animation_id: 0,
+            });
+            originals.push((hwnd, original));
+        }
+
+        let mut policy = AccentPolicy {
+            state: ACCENT_ENABLE_ACRYLIC_BLUR_BEHIND,
+            flags: 2,
+            gradient_color: TASKBAR_ACRYLIC_TINT,
+            animation_id: 0,
+        };
+        let success = if write_accent_policy(hwnd, set, &mut policy) {
+            true
+        } else {
+            policy.state = ACCENT_ENABLE_BLUR_BEHIND;
+            write_accent_policy(hwnd, set, &mut policy)
+        };
+        applied |= success;
+    }
+    applied
+}
+
+pub unsafe fn restore_acrylic() -> bool {
+    let Some((set, _)) = composition_functions() else {
+        return false;
+    };
+    let originals = ORIGINAL_TASKBAR_POLICIES.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut originals) = originals.lock() else {
+        return false;
+    };
+
+    let mut restored = originals.is_empty();
+    for (hwnd, mut policy) in originals.drain(..) {
+        restored |= write_accent_policy(hwnd, set, &mut policy);
+    }
+    restored
 }
 
 unsafe fn find_task_list() -> Option<(HWND, HWND, HWND)> {

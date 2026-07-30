@@ -74,9 +74,11 @@ Hour: 81%
 | Open Usage dashboard | 打开 Codex 官方额度页面 |
 | Start with Windows | 设置为随 Windows 启动 |
 | Center taskbar icons | 将 Windows 10 任务栏图标居中 |
+| Acrylic taskbar | 为整个任务栏启用深色半透明磨砂效果 |
 | Exit HiCodex | 退出 HiCodex |
 
-任务栏图标居中功能默认关闭，可随时通过右键菜单开启或关闭。
+任务栏图标居中和 Acrylic 毛玻璃默认关闭，可分别通过右键菜单开启或关闭。
+Acrylic 需要开启 Windows 的“透明效果”。取消 Acrylic 或退出 HiCodex 时，会恢复启用前的任务栏样式。
 
 ### 没有显示额度？
 
@@ -155,9 +157,11 @@ Right-click menu:
 | Open Usage dashboard | Open the official Codex usage page |
 | Start with Windows | Launch HiCodex when Windows starts |
 | Center taskbar icons | Center Windows 10 taskbar icons |
+| Acrylic taskbar | Apply a dark translucent blur to the full taskbar |
 | Exit HiCodex | Close HiCodex |
 
-Taskbar icon centering is disabled by default and can be toggled at any time from the right-click menu.
+Taskbar centering and Acrylic are disabled by default and can be toggled independently from the right-click menu.
+Acrylic requires Windows Transparency effects. Disabling Acrylic or exiting HiCodex restores the previous taskbar style.
 
 ### Usage is not displayed?
 
