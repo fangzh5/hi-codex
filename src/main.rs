@@ -3,6 +3,7 @@
 mod quota;
 mod rpc;
 mod startup;
+mod system_usage;
 mod taskbar;
 mod ui;
 
