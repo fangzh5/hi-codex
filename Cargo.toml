@@ -1,8 +1,8 @@
 [package]
 name = "hicodex"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "A lightweight Windows taskbar meter for Codex usage limits"
+description = "A lightweight Windows taskbar meter for Codex limits and optional system usage"
 license = "MIT"
 repository = "https://github.com/fangzh5/hi-codex"
 readme = "README.md"
