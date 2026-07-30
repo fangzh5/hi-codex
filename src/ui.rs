@@ -1,5 +1,5 @@
 use crate::quota::{QuotaWindow, UsageSnapshot};
-use crate::{rpc, startup, taskbar};
+use crate::{rpc, startup, system_usage, taskbar};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -53,7 +53,9 @@ const TIMER_POSITION: usize = 1;
 const TIMER_REFRESH: usize = 2;
 const TIMER_HIDE_FLYOUT: usize = 3;
 const TIMER_HOVER_POLL: usize = 4;
+const TIMER_SYSTEM_USAGE: usize = 5;
 const POSITION_INTERVAL_MS: u32 = 2_000;
+const SYSTEM_USAGE_INTERVAL_MS: u32 = 2_000;
 const REFRESH_INTERVAL_MS: u32 = 120_000;
 const HOVER_DELAY_MS: u32 = 300;
 const HIDE_DELAY_MS: u32 = 250;
@@ -68,6 +70,7 @@ const MENU_STARTUP: i32 = 1003;
 const MENU_CENTER_TASKBAR: i32 = 1004;
 const MENU_ACRYLIC_TASKBAR: i32 = 1005;
 const MENU_EXIT: i32 = 1006;
+const MENU_SYSTEM_USAGE: i32 = 1007;
 
 static STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -79,6 +82,8 @@ static OUTSIDE_TICKS: AtomicU32 = AtomicU32::new(0);
 static HOVER_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CENTERED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_ACRYLIC: AtomicBool = AtomicBool::new(false);
+static SYSTEM_USAGE_ENABLED: AtomicBool = AtomicBool::new(false);
+static SYSTEM_USAGE_SAMPLER: OnceLock<Mutex<system_usage::SystemUsageSampler>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -93,6 +98,7 @@ struct AppState {
     usage: UsageSnapshot,
     account: rpc::AccountSummary,
     updated_at: Option<i64>,
+    system_usage: system_usage::SystemUsage,
 }
 
 impl Default for AppState {
@@ -102,6 +108,7 @@ impl Default for AppState {
             usage: UsageSnapshot::default(),
             account: rpc::AccountSummary::default(),
             updated_at: None,
+            system_usage: system_usage::SystemUsage::default(),
         }
     }
 }
@@ -160,10 +167,17 @@ fn quota_value(quota: Option<&QuotaWindow>) -> String {
         .unwrap_or_else(|| "--".to_owned())
 }
 
-fn quota_days(quota: Option<&QuotaWindow>) -> String {
-    quota
-        .map(|quota| format!("{}d", quota.days_until_reset()))
-        .unwrap_or_default()
+fn quota_reset_compact(quota: Option<&QuotaWindow>) -> String {
+    let Some(quota) = quota else {
+        return String::new();
+    };
+    let seconds = (quota.resets_at - now_unix()).max(0);
+    match seconds {
+        0 => "now".to_owned(),
+        1..=3_599 => format!("{}m", (seconds + 59) / 60),
+        3_600..=172_799 => format!("{}h", (seconds + 3_599) / 3_600),
+        _ => format!("{}d", (seconds + 86_399) / 86_400),
+    }
 }
 
 fn color_for(quota: Option<&QuotaWindow>) -> u32 {
@@ -173,6 +187,38 @@ fn color_for(quota: Option<&QuotaWindow>) -> u32 {
         Some(_) => rgb(120, 217, 139),
         None => rgb(146, 153, 165),
     }
+}
+
+fn system_usage_value(value: Option<u8>) -> String {
+    value
+        .map(|percent| format!("{percent}%"))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
+fn color_for_system_load(value: Option<u8>) -> u32 {
+    match value {
+        Some(0..=24) => rgb(70, 130, 220),
+        Some(25..=49) => rgb(120, 217, 139),
+        Some(50..=74) => rgb(242, 198, 109),
+        Some(_) => rgb(255, 115, 115),
+        None => rgb(146, 153, 165),
+    }
+}
+
+unsafe fn refresh_system_usage(hwnd: HWND) {
+    if !SYSTEM_USAGE_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+
+    let sampler = SYSTEM_USAGE_SAMPLER
+        .get_or_init(|| Mutex::new(system_usage::SystemUsageSampler::default()));
+    let sample = sampler.lock().ok().map(|mut sampler| sampler.sample());
+    if let (Some(sample), Some(state)) = (sample, STATE.get()) {
+        if let Ok(mut state) = state.lock() {
+            state.system_usage = sample;
+        }
+    }
+    InvalidateRect(hwnd, null(), 0);
 }
 
 unsafe fn create_font_with_quality(
@@ -230,6 +276,7 @@ unsafe fn text_width(dc: HDC, font: HFONT, text: &str) -> i32 {
     SelectObject(dc, old_font);
     width
 }
+
 fn blend_pixel(output: &mut [u8], index: usize, color: u32, alpha: u8) {
     if alpha == 0 {
         return;
@@ -411,7 +458,15 @@ unsafe fn render_widget_layered(hwnd: HWND) {
     let value_muted = rgb(196, 201, 210);
     let half = height / 2;
     let padding = ((5 * dpi as i32) / 96).max(4);
-    let value_left = ((54 * dpi as i32) / 96).max(50);
+    let show_system_usage = SYSTEM_USAGE_ENABLED.load(Ordering::Acquire);
+    let quota_left = if show_system_usage {
+        ((92 * dpi as i32) / 96).max(90)
+    } else {
+        0
+    };
+    let quota_value_left = quota_left + ((54 * dpi as i32) / 96).max(51);
+    let system_value_left = ((49 * dpi as i32) / 96).max(46);
+    let system_right = ((90 * dpi as i32) / 96).max(86);
     let common_flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
     let shadow_offset = ((dpi as i32) / 96).max(1);
     let mut layer = WidgetLayer {
@@ -423,61 +478,118 @@ unsafe fn render_widget_layered(hwnd: HWND) {
         shadow_offset,
     };
 
+    if show_system_usage {
+        let cpu_label = RECT {
+            left: padding,
+            top: 0,
+            right: system_value_left,
+            bottom: half,
+        };
+        let ram_label = RECT {
+            left: padding,
+            top: half,
+            right: system_value_left,
+            bottom: height,
+        };
+        let cpu_value = RECT {
+            left: system_value_left,
+            top: 0,
+            right: system_right,
+            bottom: half,
+        };
+        let ram_value = RECT {
+            left: system_value_left,
+            top: half,
+            right: system_right,
+            bottom: height,
+        };
+        layer.draw_text(label_font, label_color, "CPU:", cpu_label, common_flags);
+        layer.draw_text(label_font, label_color, "RAM:", ram_label, common_flags);
+        layer.draw_text(
+            value_font,
+            color_for_system_load(snapshot.system_usage.cpu_percent),
+            &system_usage_value(snapshot.system_usage.cpu_percent),
+            cpu_value,
+            common_flags,
+        );
+        layer.draw_text(
+            value_font,
+            color_for_system_load(snapshot.system_usage.memory_percent),
+            &system_usage_value(snapshot.system_usage.memory_percent),
+            ram_value,
+            common_flags,
+        );
+    }
+
     let week_label = RECT {
-        left: padding,
+        left: quota_left + padding,
         top: 0,
-        right: value_left,
+        right: quota_value_left,
         bottom: half,
     };
     let hour_label = RECT {
-        left: padding,
+        left: quota_left + padding,
         top: half,
-        right: value_left,
+        right: quota_value_left,
         bottom: height,
     };
     layer.draw_text(label_font, label_color, "Week:", week_label, common_flags);
     layer.draw_text(label_font, label_color, "Hour:", hour_label, common_flags);
 
-    let (week_text, week_days, hour_text, week_color, hour_color) = match snapshot.status {
-        Status::Loading => (
-            "\u{2026}".to_owned(),
-            String::new(),
-            "\u{2026}".to_owned(),
-            value_muted,
-            value_muted,
-        ),
-        Status::Error(_) => (
-            "!".to_owned(),
-            String::new(),
-            "!".to_owned(),
-            rgb(255, 115, 115),
-            rgb(255, 115, 115),
-        ),
-        Status::Ready => (
-            quota_value(snapshot.usage.weekly.as_ref()),
-            quota_days(snapshot.usage.weekly.as_ref()),
-            quota_value(snapshot.usage.five_hour.as_ref()),
-            color_for(snapshot.usage.weekly.as_ref()),
-            color_for(snapshot.usage.five_hour.as_ref()),
-        ),
-    };
+    let (week_text, week_reset, hour_text, hour_reset, week_color, hour_color) =
+        match snapshot.status {
+            Status::Loading => (
+                "\u{2026}".to_owned(),
+                String::new(),
+                "\u{2026}".to_owned(),
+                String::new(),
+                value_muted,
+                value_muted,
+            ),
+            Status::Error(_) => (
+                "!".to_owned(),
+                String::new(),
+                "!".to_owned(),
+                String::new(),
+                rgb(255, 115, 115),
+                rgb(255, 115, 115),
+            ),
+            Status::Ready => (
+                quota_value(snapshot.usage.weekly.as_ref()),
+                quota_reset_compact(snapshot.usage.weekly.as_ref()),
+                quota_value(snapshot.usage.five_hour.as_ref()),
+                quota_reset_compact(snapshot.usage.five_hour.as_ref()),
+                color_for(snapshot.usage.weekly.as_ref()),
+                color_for(snapshot.usage.five_hour.as_ref()),
+            ),
+        };
+
+    let reset_gap = ((4 * dpi as i32) / 96).max(4);
+    let quota_reset_left = quota_value_left
+        + text_width(mask_dc, value_font, &week_text)
+            .max(text_width(mask_dc, value_font, &hour_text))
+        + reset_gap;
 
     let week_value = RECT {
-        left: value_left,
+        left: quota_value_left,
         top: 0,
         right: width - padding,
         bottom: half,
     };
-    let week_days_left =
-        value_left + text_width(mask_dc, value_font, &week_text) + ((3 * dpi as i32) / 96).max(2);
-    let week_days_rect = RECT {
-        left: week_days_left,
+    let week_reset_rect = RECT {
+        left: quota_reset_left,
         top: 0,
         right: width - padding,
         bottom: half,
     };
     let hour_value = RECT {
-        left: value_left,
+        left: quota_value_left,
+        top: half,
+        right: width - padding,
+        bottom: height,
+    };
+    let hour_reset_rect = RECT {
+        left: quota_reset_left,
         top: half,
         right: width - padding,
         bottom: height,
@@ -486,11 +598,18 @@ unsafe fn render_widget_layered(hwnd: HWND) {
     layer.draw_text(
         value_font,
         value_muted,
-        &week_days,
-        week_days_rect,
+        &week_reset,
+        week_reset_rect,
         common_flags,
     );
     layer.draw_text(value_font, hour_color, &hour_text, hour_value, common_flags);
+    layer.draw_text(
+        value_font,
+        value_muted,
+        &hour_reset,
+        hour_reset_rect,
+        common_flags,
+    );
 
     DeleteObject(label_font);
     DeleteObject(value_font);
@@ -536,6 +655,54 @@ unsafe fn draw_widget(hwnd: HWND) {
     render_widget_layered(hwnd);
 }
 
+unsafe fn widget_width(tray: HWND, dpi: u32) -> i32 {
+    if !SYSTEM_USAGE_ENABLED.load(Ordering::Acquire) {
+        return ((122 * dpi as i32) / 96).max(116);
+    }
+
+    let snapshot = STATE
+        .get()
+        .and_then(|state| state.lock().ok())
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    let (week_text, week_reset, hour_text, hour_reset) = match snapshot.status {
+        Status::Loading => (
+            "\u{2026}".to_owned(),
+            String::new(),
+            "\u{2026}".to_owned(),
+            String::new(),
+        ),
+        Status::Error(_) => ("!".to_owned(), String::new(), "!".to_owned(), String::new()),
+        Status::Ready => (
+            quota_value(snapshot.usage.weekly.as_ref()),
+            quota_reset_compact(snapshot.usage.weekly.as_ref()),
+            quota_value(snapshot.usage.five_hour.as_ref()),
+            quota_reset_compact(snapshot.usage.five_hour.as_ref()),
+        ),
+    };
+
+    let dc = GetDC(tray);
+    if dc == 0 {
+        return ((218 * dpi as i32) / 96).max(210);
+    }
+    let font = create_widget_font(dpi, 16, FW_SEMIBOLD);
+    let value_width = text_width(dc, font, &week_text).max(text_width(dc, font, &hour_text));
+    let reset_width = text_width(dc, font, &week_reset).max(text_width(dc, font, &hour_reset));
+    DeleteObject(font);
+    ReleaseDC(tray, dc);
+
+    let padding = ((5 * dpi as i32) / 96).max(4);
+    let quota_left = ((92 * dpi as i32) / 96).max(90);
+    let quota_value_left = quota_left + ((54 * dpi as i32) / 96).max(51);
+    let reset_gap = if reset_width > 0 {
+        ((4 * dpi as i32) / 96).max(4)
+    } else {
+        0
+    };
+    (quota_value_left + value_width + reset_gap + reset_width + padding)
+        .max(((176 * dpi as i32) / 96).max(170))
+}
+
 unsafe fn position_widget(hwnd: HWND) {
     let shell_class = wide("Shell_TrayWnd");
     let tray = FindWindowW(shell_class.as_ptr(), null());
@@ -560,7 +727,7 @@ unsafe fn position_widget(hwnd: HWND) {
     }
 
     let dpi = GetDpiForWindow(tray).max(96) as i32;
-    let width = (122 * dpi / 96).max(116);
+    let width = widget_width(tray, dpi as u32);
     let tray_height = tray_rect.bottom - tray_rect.top;
     let height = (42 * dpi / 96).min(tray_height.saturating_sub(2)).max(28);
     let y = ((tray_height - height) / 2).max(0);
@@ -1140,6 +1307,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let refresh = wide("Refresh now");
     let open_usage = wide("Open Usage dashboard");
     let startup_label = wide("Start with Windows");
+    let system_usage_label = wide("Show CPU and RAM");
     let center_taskbar_label = wide("Center taskbar icons");
     let acrylic_taskbar_label = wide("Acrylic taskbar");
     let exit = wide("Exit HiCodex");
@@ -1157,6 +1325,17 @@ unsafe fn show_context_menu(hwnd: HWND) {
         MF_STRING | if startup::is_enabled() { MF_CHECKED } else { 0 },
         MENU_STARTUP as usize,
         startup_label.as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING
+            | if SYSTEM_USAGE_ENABLED.load(Ordering::Acquire) {
+                MF_CHECKED
+            } else {
+                0
+            },
+        MENU_SYSTEM_USAGE as usize,
+        system_usage_label.as_ptr(),
     );
     AppendMenuW(
         menu,
@@ -1227,6 +1406,31 @@ unsafe fn show_context_menu(hwnd: HWND) {
                 taskbar::restore_acrylic();
             }
         }
+        MENU_SYSTEM_USAGE => {
+            let enabled = !SYSTEM_USAGE_ENABLED.load(Ordering::Acquire);
+            if system_usage::set_preference(enabled).is_ok() {
+                SYSTEM_USAGE_ENABLED.store(enabled, Ordering::Release);
+                let sampler = SYSTEM_USAGE_SAMPLER
+                    .get_or_init(|| Mutex::new(system_usage::SystemUsageSampler::default()));
+                if let Ok(mut sampler) = sampler.lock() {
+                    sampler.reset();
+                }
+
+                if enabled {
+                    SetTimer(hwnd, TIMER_SYSTEM_USAGE, SYSTEM_USAGE_INTERVAL_MS, None);
+                    refresh_system_usage(hwnd);
+                } else {
+                    KillTimer(hwnd, TIMER_SYSTEM_USAGE);
+                    if let Some(state) = STATE.get() {
+                        if let Ok(mut state) = state.lock() {
+                            state.system_usage = system_usage::SystemUsage::default();
+                        }
+                    }
+                }
+                position_widget(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+            }
+        }
         MENU_EXIT => {
             DestroyWindow(hwnd);
         }
@@ -1289,6 +1493,10 @@ unsafe extern "system" fn widget_window_proc(
         }
         WM_TIMER if wparam == TIMER_REFRESH => {
             trigger_refresh();
+            0
+        }
+        WM_TIMER if wparam == TIMER_SYSTEM_USAGE => {
+            refresh_system_usage(hwnd);
             0
         }
         WM_TIMER if wparam == TIMER_HOVER_POLL => {
@@ -1392,6 +1600,7 @@ pub fn run() {
     STATE.get_or_init(|| Arc::new(Mutex::new(AppState::default())));
     TASKBAR_CENTERED.store(taskbar::preference_enabled(), Ordering::Release);
     TASKBAR_ACRYLIC.store(taskbar::acrylic_preference_enabled(), Ordering::Release);
+    SYSTEM_USAGE_ENABLED.store(system_usage::preference_enabled(), Ordering::Release);
 
     unsafe {
         taskbar::initialize();
@@ -1449,6 +1658,10 @@ pub fn run() {
         SetTimer(hwnd, TIMER_POSITION, POSITION_INTERVAL_MS, None);
         SetTimer(hwnd, TIMER_REFRESH, REFRESH_INTERVAL_MS, None);
         SetTimer(hwnd, TIMER_HOVER_POLL, HOVER_POLL_INTERVAL_MS, None);
+        if SYSTEM_USAGE_ENABLED.load(Ordering::Acquire) {
+            SetTimer(hwnd, TIMER_SYSTEM_USAGE, SYSTEM_USAGE_INTERVAL_MS, None);
+            refresh_system_usage(hwnd);
+        }
         position_widget(hwnd);
         if TASKBAR_CENTERED.load(Ordering::Acquire) {
             taskbar::apply_centered();

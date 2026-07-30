@@ -29,10 +29,11 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex usage. It d
 ### 功能
 
 - 在 Windows 任务栏右侧显示 Codex 周额度和 5 小时额度
-- 显示周额度距离下一次重置的剩余天数
+- 显示周额度和 5 小时额度距离下一次重置的剩余时间
 - 鼠标悬停时显示额度详情、重置时间、订阅类型和更新时间
 - 支持手动刷新和随 Windows 启动
 - 可选将 Windows 10 任务栏图标居中
+- 可选在额度左侧显示 CPU 和 RAM 占用率
 - 不显示账号名称或邮箱
 - 原生 Windows 程序，无 WebView、Electron 或常驻网页运行环境
 
@@ -40,7 +41,7 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex usage. It d
 
 ```text
 Week: 62%  4d
-Hour: 81%
+Hour: 81%  2h
 ```
 
 百分比表示**剩余额度**。如果接口没有返回某个额度窗口，HiCodex 会显示 `--`。颜色阈值为：绿色 `51–100%`、黄色 `21–50%`、红色 `0–20%`；`Reset xN` 表示可用重置次数（如有）。
@@ -73,11 +74,13 @@ Hour: 81%
 | Refresh now | 立即刷新额度 |
 | Open Usage dashboard | 打开 Codex 官方额度页面 |
 | Start with Windows | 设置为随 Windows 启动 |
+| Show CPU and RAM | 在额度左侧显示实时 CPU 和内存占用率 |
 | Center taskbar icons | 将 Windows 10 任务栏图标居中 |
 | Acrylic taskbar | 为整个任务栏启用深色半透明磨砂效果 |
 | Exit HiCodex | 退出 HiCodex |
 
-任务栏图标居中和 Acrylic 毛玻璃默认关闭，可分别通过右键菜单开启或关闭。
+CPU/RAM、任务栏图标居中和 Acrylic 毛玻璃默认关闭，可分别通过右键菜单开启或关闭。
+CPU/RAM 颜色按占用率变化：深蓝 `0–24%`、绿色 `25–49%`、橙色 `50–74%`、红色 `75–100%`；绿、橙、红与额度显示使用同一组颜色。
 Acrylic 需要开启 Windows 的“透明效果”。取消 Acrylic 或退出 HiCodex 时，会恢复启用前的任务栏样式。
 
 ### 没有显示额度？
@@ -112,10 +115,11 @@ HiCodex 是非官方开源项目，与 OpenAI 没有关联，也未获得 OpenAI
 ### Features
 
 - Shows Codex weekly and five-hour limits on the right side of the Windows taskbar
-- Shows the number of days until the weekly limit resets
+- Shows compact reset countdowns for both weekly and five-hour limits
 - Displays usage details, reset times, plan type, and refresh time on hover
 - Supports manual refresh and launch at Windows startup
 - Optionally centers Windows 10 taskbar icons
+- Optionally shows live CPU and RAM usage to the left of the Codex limits
 - Does not display the account name or email address
 - Native Windows application with no WebView, Electron, or persistent web runtime
 
@@ -123,7 +127,7 @@ Taskbar example:
 
 ```text
 Week: 62%  4d
-Hour: 81%
+Hour: 81%  2h
 ```
 
 The percentage means **remaining capacity**. If a limit window is unavailable, HiCodex displays `--`. Colors indicate green `51–100%`, yellow `21–50%`, and red `0–20%`; `Reset xN` is the available reset-credit count when provided.
@@ -156,11 +160,13 @@ Right-click menu:
 | Refresh now | Refresh usage immediately |
 | Open Usage dashboard | Open the official Codex usage page |
 | Start with Windows | Launch HiCodex when Windows starts |
+| Show CPU and RAM | Show live CPU and memory usage to the left of the limits |
 | Center taskbar icons | Center Windows 10 taskbar icons |
 | Acrylic taskbar | Apply a dark translucent blur to the full taskbar |
 | Exit HiCodex | Close HiCodex |
 
-Taskbar centering and Acrylic are disabled by default and can be toggled independently from the right-click menu.
+CPU/RAM, taskbar centering, and Acrylic are disabled by default and can be toggled independently from the right-click menu.
+CPU/RAM colors follow load: deep blue `0–24%`, green `25–49%`, orange `50–74%`, and red `75–100%`. Green, orange, and red reuse the quota palette.
 Acrylic requires Windows Transparency effects. Disabling Acrylic or exiting HiCodex restores the previous taskbar style.
 
 ### Usage is not displayed?

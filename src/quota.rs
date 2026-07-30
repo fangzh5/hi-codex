@@ -1,6 +1,5 @@
 use serde_json::Value;
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FIVE_HOUR_MINUTES: u64 = 300;
 pub const WEEK_MINUTES: u64 = 10_080;
@@ -15,15 +14,6 @@ pub struct QuotaWindow {
 impl QuotaWindow {
     pub fn remaining_percent(&self) -> u8 {
         (100.0 - self.used_percent).clamp(0.0, 100.0).round() as u8
-    }
-
-    pub fn days_until_reset(&self) -> i64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_secs() as i64)
-            .unwrap_or(0);
-        let remaining = (self.resets_at - now).max(0);
-        (remaining + 86_399) / 86_400
     }
 }
 
