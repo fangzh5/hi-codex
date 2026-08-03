@@ -14,17 +14,27 @@ try {
         throw 'Could not prepare the MSVC Rust toolchain.'
     }
 
-    & $cargo.Source +stable-x86_64-pc-windows-msvc test
+    & $rustup.Source component add rustfmt clippy --toolchain stable-x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not prepare Rustfmt and Clippy.'
+    }
+
+    & $cargo.Source +stable-x86_64-pc-windows-msvc fmt --all -- --check
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Formatting checks failed.'
+    }
+
+    & $cargo.Source +stable-x86_64-pc-windows-msvc test --locked
     if ($LASTEXITCODE -ne 0) {
         throw 'Tests failed. Install Visual Studio Build Tools with the Desktop development with C++ workload.'
     }
 
-    & $cargo.Source +stable-x86_64-pc-windows-msvc clippy --all-targets -- -D warnings
+    & $cargo.Source +stable-x86_64-pc-windows-msvc clippy --locked --all-targets -- -D warnings
     if ($LASTEXITCODE -ne 0) {
         throw 'Clippy checks failed.'
     }
 
-    & $cargo.Source +stable-x86_64-pc-windows-msvc build --release
+    & $cargo.Source +stable-x86_64-pc-windows-msvc build --release --locked
     if ($LASTEXITCODE -ne 0) {
         throw 'Release build failed.'
     }
