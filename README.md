@@ -13,9 +13,13 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex limits with
 **[下载最新版 / Download latest](../../releases/latest)**
 
 <p align="center">
-  <img src="assets/screenshots/taskbar.png" alt="HiCodex taskbar display" width="392">
-  <br><br>
+  <img src="assets/screenshots/taskbar.png" alt="HiCodex taskbar display" width="219">
+</p>
+
+<p align="center">
   <img src="assets/screenshots/flyout.png" alt="HiCodex hover details" width="320">
+  &nbsp;&nbsp;
+  <img src="assets/screenshots/menu.png" alt="HiCodex right-click menu" width="229">
 </p>
 
 ---
