@@ -38,7 +38,7 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex limits with
 - 支持手动刷新和随 Windows 启动
 - 可选将 Windows 10 任务栏图标居中
 - 可选在额度左侧显示 CPU 和 RAM 占用率
-- 不显示账号名称或邮箱
+- 悬停面板提供眼睛按钮：默认以 `*****` 隐藏账户，点击后显示完整邮箱，方便区分多个账户
 - 原生 Windows 程序，无 WebView、Electron 或常驻网页运行环境
 
 任务栏示例：
@@ -102,7 +102,7 @@ Acrylic 需要开启 Windows 的“透明效果”。取消 Acrylic 或退出 Hi
 
 ### 隐私
 
-HiCodex 通过 Codex 官方 App Server 接口读取当前登录账号的额度信息。它不会显示账号名称或邮箱，也不会读取浏览器 Cookie。
+HiCodex 通过 Codex 官方 App Server 接口读取当前登录账号的额度信息。悬停面板默认以 `*****` 隐藏账户，点击眼睛按钮后显示完整邮箱；再次点击即可隐藏，方便截图。选择在本次运行中保持，重启后恢复隐藏。不会读取浏览器 Cookie。账户标识随额度刷新更新；刷新失败时标注为上次读取的账户。
 
 ### 说明
 
@@ -124,7 +124,7 @@ HiCodex 是非官方开源项目，与 OpenAI 没有关联，也未获得 OpenAI
 - Supports manual refresh and launch at Windows startup
 - Optionally centers Windows 10 taskbar icons
 - Optionally shows live CPU and RAM usage to the left of the Codex limits
-- Does not display the account name or email address
+- Provides an eye button on hover: hides the account as `*****` by default and reveals the full email when clicked
 - Native Windows application with no WebView, Electron, or persistent web runtime
 
 Taskbar example:
@@ -188,7 +188,7 @@ Acrylic requires Windows Transparency effects. Disabling Acrylic or exiting HiCo
 
 ### Privacy
 
-HiCodex reads usage information through the official Codex App Server interface. It does not display the account name or email address and does not read browser cookies.
+HiCodex reads usage information through the official Codex App Server interface. The hover panel hides the account as `*****` by default. Click the eye button to reveal the full email, or click again to hide it for screenshots. This choice lasts for the current session; restarting hides it again. HiCodex does not read browser cookies. The account label updates with usage; a failed refresh labels it as the last account read.
 
 ### Disclaimer
 
