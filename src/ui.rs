@@ -83,6 +83,8 @@ static HOVER_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CENTERED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_ACRYLIC: AtomicBool = AtomicBool::new(false);
 static SYSTEM_USAGE_ENABLED: AtomicBool = AtomicBool::new(false);
+static ACCOUNT_VISIBLE: AtomicBool = AtomicBool::new(false);
+static ACCOUNT_BUTTON_PRESSED: AtomicBool = AtomicBool::new(false);
 static SYSTEM_USAGE_SAMPLER: OnceLock<Mutex<system_usage::SystemUsageSampler>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -1067,14 +1069,14 @@ unsafe fn draw_flyout(hwnd: HWND) {
         left,
         top: scale(162),
         right: scale(150),
-        bottom: bounds.bottom - scale(7),
+        bottom: scale(181),
     };
     paint_text(dc, secondary_font, body, &footer, &mut footer_rect, common);
     let mut reset_badge_rect = RECT {
         left: scale(150),
         top: scale(162),
         right,
-        bottom: bounds.bottom - scale(7),
+        bottom: scale(181),
     };
     paint_text(
         dc,
@@ -1084,6 +1086,74 @@ unsafe fn draw_flyout(hwnd: HWND) {
         &mut reset_badge_rect,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
     );
+
+    let account_label = if matches!(snapshot.status, Status::Error(_)) {
+        "Last account"
+    } else {
+        "Account"
+    };
+    let visible = ACCOUNT_VISIBLE.load(Ordering::Acquire);
+    let account_text = format!(
+        "{account_label}: {}",
+        account_display(&snapshot.account, visible)
+    );
+    let mut account_rect = RECT {
+        left,
+        top: scale(184),
+        right: right - scale(32),
+        bottom: scale(205),
+    };
+    paint_text(
+        dc,
+        secondary_font,
+        muted,
+        &account_text,
+        &mut account_rect,
+        common,
+    );
+
+    let button = account_button_rect(hwnd);
+    let pen = CreatePen(PS_SOLID, scale(1), muted);
+    let previous_pen = SelectObject(dc, pen);
+    let previous_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    // Keep these paths in sync with assets/icons/eye-{open,closed}.svg.
+    let point = |x, y| POINT {
+        x: button.left + scale(x),
+        y: button.top + scale(y),
+    };
+    if visible {
+        let outline = [
+            point(4, 12),
+            point(9, 5),
+            point(17, 5),
+            point(22, 12),
+            point(17, 19),
+            point(9, 19),
+            point(4, 12),
+        ];
+        windows_sys::Win32::Graphics::Gdi::PolyBezier(dc, outline.as_ptr(), outline.len() as u32);
+        windows_sys::Win32::Graphics::Gdi::Ellipse(
+            dc,
+            button.left + scale(10),
+            button.top + scale(9),
+            button.left + scale(16),
+            button.top + scale(15),
+        );
+    } else {
+        let eyelid = [point(4, 10), point(9, 17), point(17, 17), point(22, 10)];
+        windows_sys::Win32::Graphics::Gdi::PolyBezier(dc, eyelid.as_ptr(), eyelid.len() as u32);
+        for (start, end) in [
+            (point(7, 13), point(5, 16)),
+            (point(13, 15), point(13, 19)),
+            (point(19, 13), point(21, 16)),
+        ] {
+            windows_sys::Win32::Graphics::Gdi::MoveToEx(dc, start.x, start.y, null_mut());
+            windows_sys::Win32::Graphics::Gdi::LineTo(dc, end.x, end.y);
+        }
+    }
+    SelectObject(dc, previous_brush);
+    SelectObject(dc, previous_pen);
+    DeleteObject(pen);
 
     let border_pen = CreatePen(PS_SOLID, 1, rgb(73, 79, 89));
     let old_pen = SelectObject(dc, border_pen);
@@ -1156,8 +1226,26 @@ unsafe fn position_flyout(widget: HWND, flyout: HWND) {
     }
 
     let dpi = GetDpiForWindow(widget).max(96) as i32;
-    let width = 320 * dpi / 96;
-    let height = 188 * dpi / 96;
+    let mut width = 320 * dpi / 96;
+    if ACCOUNT_VISIBLE.load(Ordering::Acquire) {
+        if let Some(state) = STATE.get().and_then(|state| state.lock().ok()) {
+            let text = wide(&format!(
+                "Last account: {}",
+                account_display(&state.account, true)
+            ));
+            let dc = GetDC(widget);
+            let font = create_font(dpi as u32, 14, FW_NORMAL);
+            let old_font = SelectObject(dc, font);
+            let mut size: SIZE = zeroed();
+            if GetTextExtentPoint32W(dc, text.as_ptr(), (text.len() - 1) as i32, &mut size) != 0 {
+                width = width.max(size.cx + 76 * dpi / 96);
+            }
+            SelectObject(dc, old_font);
+            DeleteObject(font);
+            ReleaseDC(widget, dc);
+        }
+    }
+    let height = 214 * dpi / 96;
     let gap = (9 * dpi / 96).max(6);
 
     let monitor = MonitorFromWindow(widget, MONITOR_DEFAULTTONEAREST);
@@ -1168,6 +1256,7 @@ unsafe fn position_flyout(widget: HWND, flyout: HWND) {
     }
 
     let work = monitor_info.rcWork;
+    width = width.min(work.right - work.left);
     let max_x = (work.right - width).max(work.left);
     let widget_center = widget_rect.left + (widget_rect.right - widget_rect.left) / 2;
     let x = (widget_center - width / 2).clamp(work.left, max_x);
@@ -1546,6 +1635,33 @@ unsafe extern "system" fn widget_window_proc(
     }
 }
 
+fn account_display(account: &rpc::AccountSummary, visible: bool) -> &str {
+    if visible {
+        account.email.as_deref().unwrap_or("--")
+    } else {
+        "*****"
+    }
+}
+
+unsafe fn account_button_rect(hwnd: HWND) -> RECT {
+    let mut bounds: RECT = zeroed();
+    GetClientRect(hwnd, &mut bounds);
+    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+    RECT {
+        left: bounds.right - 44 * dpi / 96,
+        top: 183 * dpi / 96,
+        right: bounds.right - 18 * dpi / 96,
+        bottom: 207 * dpi / 96,
+    }
+}
+
+unsafe fn account_button_hit(hwnd: HWND, lparam: LPARAM) -> bool {
+    let x = lparam as u16 as i16 as i32;
+    let y = (lparam >> 16) as u16 as i16 as i32;
+    let rect = account_button_rect(hwnd);
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
 unsafe extern "system" fn flyout_window_proc(
     hwnd: HWND,
     message: u32,
@@ -1553,6 +1669,48 @@ unsafe extern "system" fn flyout_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN => {
+            if account_button_hit(hwnd, lparam) {
+                ACCOUNT_BUTTON_PRESSED.store(true, Ordering::Release);
+                SetCapture(hwnd);
+            }
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
+            let pressed = ACCOUNT_BUTTON_PRESSED.swap(false, Ordering::AcqRel);
+            if pressed {
+                ReleaseCapture();
+                if account_button_hit(hwnd, lparam) {
+                    ACCOUNT_VISIBLE.fetch_xor(true, Ordering::AcqRel);
+                    position_flyout(WINDOW.load(Ordering::Acquire), hwnd);
+                    InvalidateRect(hwnd, null(), 1);
+                }
+            }
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
+            ACCOUNT_BUTTON_PRESSED.store(false, Ordering::Release);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR => {
+            let mut point: POINT = zeroed();
+            GetCursorPos(&mut point);
+            windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
+            let rect = account_button_rect(hwnd);
+            if point.x >= rect.left
+                && point.x < rect.right
+                && point.y >= rect.top
+                && point.y < rect.bottom
+            {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(LoadCursorW(
+                    0,
+                    windows_sys::Win32::UI::WindowsAndMessaging::IDC_HAND,
+                ));
+                1
+            } else {
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            }
+        }
         WM_PAINT => {
             draw_flyout(hwnd);
             0
@@ -1644,7 +1802,7 @@ pub fn run() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             320,
-            188,
+            214,
             0,
             0 as HMENU,
             instance,
@@ -1682,5 +1840,36 @@ pub fn run() {
         }
         WINDOW.store(0, Ordering::Release);
         taskbar::shutdown();
+    }
+}
+
+#[cfg(test)]
+mod account_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_account_never_exposes_identity_even_after_refresh() {
+        for email in [
+            None,
+            Some("alice123@gmail.com"),
+            Some("another@example.com"),
+        ] {
+            let account = rpc::AccountSummary {
+                email: email.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(account_display(&account, false), "*****");
+        }
+    }
+
+    #[test]
+    fn visible_account_preserves_full_email_and_handles_missing_identity() {
+        let account = rpc::AccountSummary {
+            email: Some("alice123@gmail.com".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(account_display(&account, true), "alice123@gmail.com");
+        assert_eq!(account_display(&rpc::AccountSummary::default(), true), "--");
+        assert!(!format!("{account:?}").contains("alice123@gmail.com"));
     }
 }

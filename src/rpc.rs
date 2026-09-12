@@ -11,9 +11,20 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct AccountSummary {
     pub plan_type: Option<String>,
+    pub email: Option<String>,
+}
+
+impl std::fmt::Debug for AccountSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountSummary")
+            .field("plan_type", &self.plan_type)
+            .field("email", &self.email.as_ref().map(|_| "*****"))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +75,12 @@ fn parse_account(response: &Value) -> AccountSummary {
         .and_then(|result| result.get("account"));
 
     AccountSummary {
+        email: account
+            .and_then(|value| value.get("email"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+            .map(str::to_owned),
         plan_type: account
             .and_then(|value| value.get("planType"))
             .and_then(Value::as_str)
@@ -176,12 +193,11 @@ pub fn fetch_usage() -> Result<UsageResult, String> {
                 "params": { "refreshToken": false }
             }),
         )?;
+        let account_response = wait_for_response(&receiver, 2, REQUEST_TIMEOUT)?;
         send(
             &mut stdin,
             &json!({"method": "account/rateLimits/read", "id": 3}),
         )?;
-
-        let account_response = wait_for_response(&receiver, 2, REQUEST_TIMEOUT)?;
         let limits_response = wait_for_response(&receiver, 3, REQUEST_TIMEOUT)?;
         let usage = parse_rate_limit_response(&limits_response)?;
 
@@ -196,4 +212,26 @@ pub fn fetch_usage() -> Result<UsageResult, String> {
     let _ = child.wait();
     let _ = reader.join();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_response_preserves_full_identity() {
+        let account = parse_account(&json!({"result": {"account": {
+            "type": "chatgpt", "email": "alice123@gmail.com", "planType": "plus"
+        }}}));
+        assert_eq!(account.email.as_deref(), Some("alice123@gmail.com"));
+        assert_eq!(account.plan_type.as_deref(), Some("plus"));
+        assert!(parse_account(&json!({"result": {"account": null}}))
+            .email
+            .is_none());
+        assert!(
+            parse_account(&json!({"result": {"account": {"type": "apiKey"}}}))
+                .email
+                .is_none()
+        );
+    }
 }
