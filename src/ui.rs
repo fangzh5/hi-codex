@@ -443,7 +443,7 @@ unsafe fn render_widget_layered(hwnd: HWND) {
     let byte_count = (width * height * 4) as usize;
     std::ptr::write_bytes(output_bits, 0, byte_count);
     let output = std::slice::from_raw_parts_mut(output_bits as *mut u8, byte_count);
-    for pixel in output.chunks_exact_mut(4) {
+    for pixel in output.as_chunks_mut::<4>().0 {
         pixel[3] = 1;
     }
 
