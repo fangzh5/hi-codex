@@ -17,9 +17,7 @@ fn wide(value: &str) -> Vec<u16> {
 
 fn main() {
     if std::env::args().any(|argument| argument == "--diagnose") {
-        let result = rpc::fetch_usage();
-        rpc::shutdown();
-        match result {
+        match rpc::fetch_usage() {
             Ok(result) => println!("{result:#?}"),
             Err(error) => {
                 eprintln!("HiCodex diagnostic failed: {error}");
@@ -41,6 +39,5 @@ fn main() {
     }
 
     ui::run();
-    rpc::shutdown();
     unsafe { CloseHandle(mutex) };
 }

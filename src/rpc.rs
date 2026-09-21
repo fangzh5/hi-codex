@@ -4,18 +4,12 @@ use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_ATTEMPTS: usize = 3;
-const RETRY_DELAYS: [Duration; MAX_ATTEMPTS - 1] = [Duration::from_secs(1), Duration::from_secs(3)];
-
-static CLIENT: OnceLock<Mutex<Option<AppServerClient>>> = OnceLock::new();
 
 #[derive(Clone, Default)]
 pub struct AccountSummary {
@@ -150,58 +144,35 @@ fn start_app_server() -> Result<Child, String> {
             .unwrap_or_else(|| "no executable candidate was found".to_owned())
     ))
 }
+pub fn fetch_usage() -> Result<UsageResult, String> {
+    let mut child = start_app_server()?;
 
-struct AppServerClient {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    receiver: Receiver<Value>,
-    reader: Option<JoinHandle<()>>,
-    next_request_id: i64,
-}
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Codex App Server stdin was unavailable".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Codex App Server stdout was unavailable".to_owned())?;
 
-impl AppServerClient {
-    fn connect() -> Result<Self, String> {
-        let mut child = start_app_server()?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Codex App Server stdin was unavailable".to_owned());
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Codex App Server stdout was unavailable".to_owned());
-            }
-        };
-
-        let (sender, receiver) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                    if sender.send(value).is_err() {
-                        break;
-                    }
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if sender.send(value).is_err() {
+                    break;
                 }
             }
-        });
+        }
+    });
 
-        let mut client = Self {
-            child,
-            stdin: Some(stdin),
-            receiver,
-            reader: Some(reader),
-            next_request_id: 1,
-        };
-        let initialize_id = client.request_id();
-        let initialize_result = (|| {
-            client.send(&json!({
+    let result = (|| {
+        send(
+            &mut stdin,
+            &json!({
                 "method": "initialize",
-                "id": initialize_id,
+                "id": 1,
                 "params": {
                     "clientInfo": {
                         "name": "hi-codex",
@@ -209,118 +180,38 @@ impl AppServerClient {
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }
-            }))?;
-            wait_for_response(&client.receiver, initialize_id, REQUEST_TIMEOUT)?;
-            client.send(&json!({"method": "initialized", "params": {}}))
-        })();
+            }),
+        )?;
+        wait_for_response(&receiver, 1, REQUEST_TIMEOUT)?;
 
-        match initialize_result {
-            Ok(()) => Ok(client),
-            Err(error) => {
-                client.stop();
-                Err(error)
-            }
-        }
-    }
-
-    fn request_id(&mut self) -> i64 {
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
-        request_id
-    }
-
-    fn send(&mut self, message: &Value) -> Result<(), String> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "Codex App Server stdin was unavailable".to_owned())?;
-        send(stdin, message)
-    }
-
-    fn fetch_usage(&mut self) -> Result<UsageResult, String> {
-        let account_id = self.request_id();
-        self.send(&json!({
-            "method": "account/read",
-            "id": account_id,
-            "params": { "refreshToken": false }
-        }))?;
-        let account_response = wait_for_response(&self.receiver, account_id, REQUEST_TIMEOUT)?;
-
-        let limits_id = self.request_id();
-        self.send(&json!({
-            "method": "account/rateLimits/read",
-            "id": limits_id
-        }))?;
-        let limits_response = wait_for_response(&self.receiver, limits_id, REQUEST_TIMEOUT)?;
+        send(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
+        send(
+            &mut stdin,
+            &json!({
+                "method": "account/read",
+                "id": 2,
+                "params": { "refreshToken": false }
+            }),
+        )?;
+        let account_response = wait_for_response(&receiver, 2, REQUEST_TIMEOUT)?;
+        send(
+            &mut stdin,
+            &json!({"method": "account/rateLimits/read", "id": 3}),
+        )?;
+        let limits_response = wait_for_response(&receiver, 3, REQUEST_TIMEOUT)?;
         let usage = parse_rate_limit_response(&limits_response)?;
 
         Ok(UsageResult {
             usage,
             account: parse_account(&account_response),
         })
-    }
+    })();
 
-    fn stop(&mut self) {
-        self.stdin.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
-
-impl Drop for AppServerClient {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn client() -> &'static Mutex<Option<AppServerClient>> {
-    CLIENT.get_or_init(|| Mutex::new(None))
-}
-
-pub fn fetch_usage() -> Result<UsageResult, String> {
-    let mut client = client()
-        .lock()
-        .map_err(|_| "Codex App Server client lock was poisoned".to_owned())?;
-    let mut last_error = None;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        if client.is_none() {
-            match AppServerClient::connect() {
-                Ok(connected) => *client = Some(connected),
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        if let Some(connected) = client.as_mut() {
-            match connected.fetch_usage() {
-                Ok(result) => return Ok(result),
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        // A timed-out or disconnected process may still have unread responses.
-        // Always discard it before retrying so the next attempt starts cleanly.
-        drop(client.take());
-        if let Some(delay) = RETRY_DELAYS.get(attempt) {
-            std::thread::sleep(*delay);
-        }
-    }
-
-    Err(format!(
-        "Codex usage refresh failed after {MAX_ATTEMPTS} attempts: {}",
-        last_error.unwrap_or_else(|| "unknown error".to_owned())
-    ))
-}
-
-pub fn shutdown() {
-    if let Some(client) = CLIENT.get() {
-        if let Ok(mut client) = client.lock() {
-            drop(client.take());
-        }
-    }
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    result
 }
 
 #[cfg(test)]
