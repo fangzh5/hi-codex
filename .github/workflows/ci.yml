@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/experimental-account-switching]
   pull_request:
 
 permissions:
@@ -24,3 +24,9 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --release --locked
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: HiCodex-windows-x64
+          path: target/release/hicodex.exe
+          if-no-files-found: error

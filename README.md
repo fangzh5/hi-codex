@@ -12,6 +12,26 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex limits with
 
 **[下载最新版 / Download latest](../../releases/latest)**
 
+### 实验性预发布版：可选账号切换
+
+`v0.3.3-beta.1`（`codex/experimental-account-switching` 分支）增加原生账号管理，不依赖 codex-auth、Node.js 或 codext。[下载实验版](https://github.com/fangzh5/hi-codex/releases/tag/v0.3.3-beta.1)。稳定版仍为 `v0.3.2`，上方最新版链接仍指向稳定版。
+
+- 原有额度查看无需启用多账号，也不会自动创建账号库。
+- 右键菜单 **Accounts (experimental)** → **Save current account** 保存当前登录账号。添加另一个账号时，先在 Codex 正常登录，再保存。
+- 已使用 codex-auth：选择 **Import existing codex-auth accounts**，从同一个 `CODEX_HOME` 读取已登记的 ChatGPT 快照及别名，不修改它的文件或当前登录。也可通过 **Import auth JSON...** 导入 Codex 生成的 `auth.json`；这是内部凭据格式，并非保证长期兼容的公开标准，不支持 CPA 格式或 API Key 账号。
+- 账号菜单默认隐藏邮箱、别名和工作区；在悬停面板点击眼睛按钮后可显示身份。每个账号保留独立编号，并显示工作区短标识，便于区分同邮箱账号。
+- 当前选中的账号带勾且不可重复点击。保存、导入和切换成功后，结果在详情面板显示约 8 秒，无需点击“确定”；切换与恢复前仍需确认，失败时保留具体错误提示。
+- 在子菜单点击账号后，先关闭 Codex 和其他账号切换工具，核对确认框中的目标，再手动重新打开 Codex。本地选择保存后，HiCodex 自动刷新额度验证访问，并重新隐藏账号身份。
+- **Restore last switch backup** 可恢复最近一次切换前的凭据，也支持当前凭据文件缺失或 JSON 语法损坏的情况；检测到后续有效登录或凭据刷新时会拒绝覆盖，此时使用账号菜单重新选择。权限不足和无法读取文件不会被视为文件损坏。
+- 独立账号库保存在 `$CODEX_HOME/hi-codex/accounts.dpapi`，使用 Windows DPAPI 绑定当前 Windows 用户加密，包含凭据与最近一次恢复备份。不能作为跨机器迁移文件；原始导入文件仍需自行妥善保管。
+- 首版限 Windows 原生、ChatGPT 文件凭据模式。显式 `keyring`、`auto`、`ephemeral`、WSL 和环境凭据覆盖会阻止切换，不影响额度查看。未设置凭据存储模式时按 Codex 的默认文件模式处理；不会修改你的 Codex 配置。
+- 导入是一次性复制，账号库和别名不自动同步，重复导入不覆盖已有快照。请不要交替使用多个管理器操作同一组旧快照，刷新后的凭据可能让其他副本失效；需要时重新在 Codex 登录并保存当前账号。
+- codex-auth 导入会跳过损坏、不支持、未登记和重复的快照，并显示新增与跳过数量；手动选择的 JSON 批量文件仍须全部有效才会导入。
+- 文件替换失败时保留恢复副本，必要时自动还原原文件；账号库主文件缺失时可读取恢复副本。正常写入完成后会清理副本，异常中断遗留的 `.hicodex-backup` 与 `.hicodex-*.tmp` 文件可能包含凭据，应妥善保管。
+- 非法或损坏的账号库只影响账号管理；额度查看继续走原有 App Server 接口。仍需在真实 Windows 桌面上手动验收，暂不作为稳定功能发布。
+
+Experimental accounts are opt-in and independent of codex-auth. Use the **Accounts (experimental)** menu to save the current ChatGPT login, import Codex-generated auth JSON or registered codex-auth snapshots, switch accounts, or restore the last switch backup. Close Codex before switching and reopen it manually. Snapshots are encrypted using Windows user-scoped DPAPI. File credentials and Windows-native Codex are supported; API keys, WSL and keyring/auto/ephemeral modes are not. Imports do not change the active login or overwrite existing snapshots. Existing quota viewing remains available without account setup. [v0.3.3-beta.1](https://github.com/fangzh5/hi-codex/releases/tag/v0.3.3-beta.1) is a prerelease; v0.3.2 remains the latest stable release. Desktop acceptance testing is still required before stable promotion.
+
 <p align="center">
   <img src="assets/screenshots/taskbar.png" alt="HiCodex taskbar display" width="478">
 </p>

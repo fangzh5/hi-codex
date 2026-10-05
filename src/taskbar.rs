@@ -6,15 +6,16 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
 use windows_sys::Win32::UI::Accessibility::AccessibleObjectFromWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, OBJID_CLIENT, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
+    FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, OBJID_CLIENT, SWP_NOACTIVATE,
+    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
 };
 
 const SETTINGS_KEY: &str = r"HKCU\Software\HiCodex";
@@ -29,6 +30,41 @@ const TASKBAR_ACRYLIC_TINT: u32 = 0x9028_2220;
 
 static COM_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_TASKBAR_POLICIES: OnceLock<Mutex<Vec<(HWND, AccentPolicy)>>> = OnceLock::new();
+static TASK_LIST_PLACEMENT: Mutex<Option<TaskListPlacement>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskListPlacement {
+    parent: HWND,
+    window: HWND,
+    original: (i32, i32),
+    applied: (i32, i32),
+}
+
+impl TaskListPlacement {
+    fn owns_position(&self, parent: HWND, window: HWND, current: (i32, i32)) -> bool {
+        self.parent == parent && self.window == window && self.applied == current
+    }
+
+    fn after_move(
+        previous: Option<Self>,
+        parent: HWND,
+        window: HWND,
+        current: (i32, i32),
+        applied: (i32, i32),
+    ) -> Self {
+        // If Explorer or another tool moved the list, preserve that newer
+        // position as the baseline for our next move.
+        let original = previous
+            .filter(|saved| saved.owns_position(parent, window, current))
+            .map_or(current, |saved| saved.original);
+        Self {
+            parent,
+            window,
+            original,
+            applied,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -395,29 +431,112 @@ pub unsafe fn apply_centered() -> bool {
         available_left + (available_width - group_width) / 2
     };
     let target_list_left = target_group_left - leading_margin;
-    let local_x = (target_list_left - switch_rect.left).max(0);
-    SetWindowPos(
+    let mut current = POINT {
+        x: list_rect.left,
+        y: list_rect.top,
+    };
+    let mut target = POINT {
+        x: target_list_left,
+        y: list_rect.top,
+    };
+    if ScreenToClient(task_switch, &mut current) == 0
+        || ScreenToClient(task_switch, &mut target) == 0
+    {
+        return false;
+    }
+    let current = (current.x, current.y);
+    let target = (target.x.max(0), target.y);
+    if current == target {
+        return true;
+    }
+    let Ok(mut saved) = TASK_LIST_PLACEMENT.lock() else {
+        return false;
+    };
+    if SetWindowPos(
         task_list,
         0,
-        local_x,
+        target.0,
+        target.1,
         0,
         0,
-        0,
-        SWP_NOSIZE | SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING,
-    ) != 0
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING,
+    ) == 0
+    {
+        return false;
+    }
+    *saved = Some(TaskListPlacement::after_move(
+        *saved,
+        task_switch,
+        task_list,
+        current,
+        target,
+    ));
+    true
 }
 
 pub unsafe fn restore_left() -> bool {
-    let Some((_, _, task_list)) = find_task_list() else {
+    let Ok(mut saved) = TASK_LIST_PLACEMENT.lock() else {
         return false;
     };
-    SetWindowPos(
+    let Some(placement) = *saved else {
+        return true;
+    };
+    let Some((_, task_switch, task_list)) = find_task_list() else {
+        *saved = None;
+        return true;
+    };
+    let mut rect: RECT = zeroed();
+    if GetWindowRect(task_list, &mut rect) == 0 {
+        return false;
+    }
+    let mut current = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    if ScreenToClient(task_switch, &mut current) == 0 {
+        return false;
+    }
+    if !placement.owns_position(task_switch, task_list, (current.x, current.y)) {
+        *saved = None;
+        return true;
+    }
+    if SetWindowPos(
         task_list,
         0,
+        placement.original.0,
+        placement.original.1,
         0,
         0,
-        0,
-        0,
-        SWP_NOSIZE | SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING,
-    ) != 0
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING,
+    ) == 0
+    {
+        return false;
+    }
+    *saved = None;
+    true
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::TaskListPlacement;
+
+    #[test]
+    fn repeated_centering_preserves_original_position() {
+        let first = TaskListPlacement::after_move(None, 1, 2, (40, 3), (300, 3));
+        let next = TaskListPlacement::after_move(Some(first), 1, 2, (300, 3), (350, 3));
+        assert_eq!(next.original, (40, 3));
+        assert!(next.owns_position(1, 2, (350, 3)));
+    }
+
+    #[test]
+    fn external_move_or_recreated_window_is_not_owned() {
+        let saved = TaskListPlacement::after_move(None, 1, 2, (40, 3), (300, 3));
+        assert!(!saved.owns_position(1, 2, (120, 3)));
+        assert!(!saved.owns_position(1, 9, (300, 3)));
+        assert!(!saved.owns_position(9, 2, (300, 3)));
+        let next = TaskListPlacement::after_move(Some(saved), 1, 2, (120, 3), (350, 3));
+        assert_eq!(next.original, (120, 3));
+        let recreated = TaskListPlacement::after_move(Some(saved), 1, 9, (80, 0), (350, 0));
+        assert_eq!(recreated.original, (80, 0));
+    }
 }

@@ -1,5 +1,5 @@
 use crate::quota::{QuotaWindow, UsageSnapshot};
-use crate::{rpc, startup, system_usage, taskbar};
+use crate::{accounts, rpc, startup, system_usage, taskbar};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -25,6 +25,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::Controls::{WM_MOUSEHOVER, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -34,13 +38,14 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, FindWindowExW, FindWindowW, GetClientRect, GetCursorPos, GetMessageW,
-    GetParent, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW,
+    GetParent, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes, SetParent,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
     UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_EXSTYLE, GWL_STYLE, HMENU,
-    HWND_TOP, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, MF_CHECKED, MF_SEPARATOR,
-    MF_STRING, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND,
+    HWND_TOP, HWND_TOPMOST, IDC_ARROW, IDYES, LWA_ALPHA, MA_NOACTIVATE, MB_DEFBUTTON2,
+    MB_ICONWARNING, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND,
     WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE,
     WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     WS_VISIBLE,
@@ -54,6 +59,8 @@ const TIMER_REFRESH: usize = 2;
 const TIMER_HIDE_FLYOUT: usize = 3;
 const TIMER_HOVER_POLL: usize = 4;
 const TIMER_SYSTEM_USAGE: usize = 5;
+const TIMER_ACCOUNT_FEEDBACK: usize = 6;
+const ACCOUNT_FEEDBACK_MS: u32 = 8_000;
 const POSITION_INTERVAL_MS: u32 = 2_000;
 const SYSTEM_USAGE_INTERVAL_MS: u32 = 2_000;
 const REFRESH_INTERVAL_MS: u32 = 120_000;
@@ -63,6 +70,7 @@ const HOVER_POLL_INTERVAL_MS: u32 = 100;
 const HOVER_SHOW_TICKS: u32 = 3;
 const HOVER_HIDE_TICKS: u32 = 3;
 const WM_REFRESHED: u32 = WM_APP + 1;
+const WM_ACCOUNT_DONE: u32 = WM_APP + 2;
 
 const MENU_REFRESH: i32 = 1001;
 const MENU_OPEN_USAGE: i32 = 1002;
@@ -71,12 +79,22 @@ const MENU_CENTER_TASKBAR: i32 = 1004;
 const MENU_ACRYLIC_TASKBAR: i32 = 1005;
 const MENU_EXIT: i32 = 1006;
 const MENU_SYSTEM_USAGE: i32 = 1007;
+const MENU_SAVE_ACCOUNT: i32 = 1010;
+const MENU_IMPORT_ACCOUNT: i32 = 1011;
+const MENU_IMPORT_CODEX_AUTH: i32 = 1012;
+const MENU_RESTORE_ACCOUNT: i32 = 1013;
+const MENU_ACCOUNT_FIRST: i32 = 2000;
 
 static STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static FLYOUT_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static FLYOUT_GLASS: AtomicBool = AtomicBool::new(false);
 static REFRESHING: AtomicBool = AtomicBool::new(false);
+static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static ACCOUNT_OPERATION: AtomicBool = AtomicBool::new(false);
+// Serialize credential mutations against this process's App Server readers.
+static AUTH_GATE: Mutex<()> = Mutex::new(());
+static ACCOUNT_NOTICE: Mutex<Option<(String, bool)>> = Mutex::new(None);
 static HOVER_TICKS: AtomicU32 = AtomicU32::new(0);
 static OUTSIDE_TICKS: AtomicU32 = AtomicU32::new(0);
 static HOVER_SUPPRESSED: AtomicBool = AtomicBool::new(false);
@@ -101,6 +119,7 @@ struct AppState {
     account: rpc::AccountSummary,
     updated_at: Option<i64>,
     system_usage: system_usage::SystemUsage,
+    account_feedback: Option<String>,
 }
 
 impl Default for AppState {
@@ -111,6 +130,7 @@ impl Default for AppState {
             account: rpc::AccountSummary::default(),
             updated_at: None,
             system_usage: system_usage::SystemUsage::default(),
+            account_feedback: None,
         }
     }
 }
@@ -131,13 +151,22 @@ fn now_unix() -> i64 {
 }
 
 fn trigger_refresh() {
-    if REFRESHING.swap(true, Ordering::AcqRel) {
+    if ACCOUNT_OPERATION.load(Ordering::Acquire) || REFRESHING.swap(true, Ordering::AcqRel) {
+        REFRESH_PENDING.store(true, Ordering::Release);
         return;
     }
 
     std::thread::spawn(|| {
-        let result = rpc::fetch_usage();
-        if let Some(state) = STATE.get() {
+        let Ok(_gate) = AUTH_GATE.lock() else {
+            REFRESHING.store(false, Ordering::Release);
+            return;
+        };
+        let result = rpc::fetch_usage_cancellable(&ACCOUNT_OPERATION);
+        if ACCOUNT_OPERATION.load(Ordering::Acquire) {
+            // The account worker is waiting for AUTH_GATE, so its completion
+            // cannot consume this retry before we have recorded it.
+            REFRESH_PENDING.store(true, Ordering::Release);
+        } else if let Some(state) = STATE.get() {
             if let Ok(mut state) = state.lock() {
                 match result {
                     Ok(result) => {
@@ -161,6 +190,211 @@ fn trigger_refresh() {
             }
         }
     });
+}
+
+enum AccountAction {
+    Save,
+    Import(std::path::PathBuf),
+    ImportCodexAuth,
+    Switch(String),
+    Restore,
+}
+
+fn begin_account_action(action: AccountAction) {
+    if ACCOUNT_OPERATION.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let changes_auth = matches!(&action, AccountAction::Switch(_) | AccountAction::Restore);
+        let result = (|| {
+            let _gate = AUTH_GATE
+                .lock()
+                .map_err(|_| "Account operation lock is unavailable".to_owned())?;
+            let manager = accounts::AccountManager::current()?;
+            match action {
+                AccountAction::Save => {
+                    manager.save_current()?;
+                    Ok(("Account saved.".to_owned(), false))
+                }
+                AccountAction::Import(path) => {
+                    let count = manager.import_file(&path)?;
+                    Ok((format!("Added {count}. Current account unchanged."), false))
+                }
+                AccountAction::ImportCodexAuth => {
+                    let report = manager.import_codex_auth()?;
+                    Ok((
+                        format!(
+                            "Added {}; skipped {}. Current account unchanged.",
+                            report.added, report.skipped
+                        ),
+                        false,
+                    ))
+                }
+                AccountAction::Switch(key) => {
+                    let changed = manager.switch(&key)?;
+                    Ok((
+                        if changed {
+                            "Account selected. Reopen Codex."
+                        } else {
+                            "This account is already selected."
+                        }
+                        .to_owned(),
+                        changed,
+                    ))
+                }
+                AccountAction::Restore => {
+                    manager.restore()?;
+                    Ok(("Account restored. Reopen Codex.".to_owned(), true))
+                }
+            }
+        })();
+        let (message, changed, failed) = match result {
+            Ok((message, changed)) => (message, changed, false),
+            // A post-commit verification failure may have changed auth. Always
+            // re-read after attempted writes instead of showing the old quota.
+            Err(error) => (error, changes_auth, true),
+        };
+        if let Ok(mut notice) = ACCOUNT_NOTICE.lock() {
+            *notice = Some((message, failed));
+        }
+        let hwnd = WINDOW.load(Ordering::Acquire);
+        if hwnd != 0 {
+            unsafe {
+                PostMessageW(hwnd, WM_ACCOUNT_DONE, usize::from(changed), 0);
+            }
+        } else {
+            ACCOUNT_OPERATION.store(false, Ordering::Release);
+        }
+    });
+}
+
+unsafe fn confirm_switch(hwnd: HWND, target: &str) -> bool {
+    let message = format!(
+        "Switch to {target}?\n\nClose Codex and other switchers first.\nReopen Codex afterward."
+    );
+    MessageBoxW(
+        hwnd,
+        wide(&message).as_ptr(),
+        wide("Switch account").as_ptr(),
+        MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING,
+    ) == IDYES
+}
+
+unsafe fn confirm_restore(hwnd: HWND) -> bool {
+    MessageBoxW(hwnd, wide("Restore the previous account?\n\nClose Codex and other switchers first.\nReopen Codex afterward.").as_ptr(),
+        wide("Restore account").as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES
+}
+
+unsafe fn select_auth_file(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut buffer = [0u16; 32_768];
+    let filter = wide("Auth JSON files\0*.json\0All files\0*.*\0");
+    let title = wide("Import a Codex auth JSON file (credentials stay on this PC)");
+    let mut dialog: OPENFILENAMEW = zeroed();
+    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = hwnd;
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if GetOpenFileNameW(&mut dialog) != 0 {
+        use std::os::windows::ffi::OsStringExt;
+        let length = buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(buffer.len());
+        Some(std::ffi::OsString::from_wide(&buffer[..length]).into())
+    } else {
+        if CommDlgExtendedError() != 0 {
+            MessageBoxW(
+                hwnd,
+                wide("Could not open the file picker. No account was imported.").as_ptr(),
+                wide("HiCodex").as_ptr(),
+                MB_ICONWARNING,
+            );
+        }
+        None
+    }
+}
+
+unsafe fn append_account_menu(menu: HMENU) -> Vec<accounts::Account> {
+    let submenu = CreatePopupMenu();
+    if submenu == 0 {
+        return Vec::new();
+    }
+    let busy = ACCOUNT_OPERATION.load(Ordering::Acquire);
+    let flags = MF_STRING | if busy { MF_GRAYED } else { 0 };
+    AppendMenuW(
+        submenu,
+        flags,
+        MENU_SAVE_ACCOUNT as usize,
+        wide("Save current account").as_ptr(),
+    );
+    AppendMenuW(
+        submenu,
+        flags,
+        MENU_IMPORT_ACCOUNT as usize,
+        wide("Import auth JSON...").as_ptr(),
+    );
+    AppendMenuW(
+        submenu,
+        flags,
+        MENU_IMPORT_CODEX_AUTH as usize,
+        wide("Import existing codex-auth accounts").as_ptr(),
+    );
+    AppendMenuW(submenu, MF_SEPARATOR, 0, null());
+    let result = accounts::AccountManager::current().and_then(|manager| manager.list());
+    let accounts = match result {
+        Ok(list) => {
+            for (index, account) in list.accounts.iter().enumerate() {
+                let active = list.active_key.as_deref() == Some(&account.key);
+                AppendMenuW(
+                    submenu,
+                    flags | if active { MF_CHECKED | MF_GRAYED } else { 0 },
+                    MENU_ACCOUNT_FIRST as usize + index,
+                    wide(&account.label(ACCOUNT_VISIBLE.load(Ordering::Acquire), index)).as_ptr(),
+                );
+            }
+            if list.accounts.is_empty() {
+                AppendMenuW(
+                    submenu,
+                    MF_STRING | MF_GRAYED,
+                    0,
+                    wide("No saved accounts").as_ptr(),
+                );
+            }
+            AppendMenuW(submenu, MF_SEPARATOR, 0, null());
+            AppendMenuW(
+                submenu,
+                MF_STRING
+                    | if busy || !list.can_restore {
+                        MF_GRAYED
+                    } else {
+                        0
+                    },
+                MENU_RESTORE_ACCOUNT as usize,
+                wide("Restore last switch backup").as_ptr(),
+            );
+            list.accounts
+        }
+        Err(_) => {
+            // Account storage failure must never change quota status.
+            AppendMenuW(
+                submenu,
+                MF_STRING | MF_GRAYED,
+                0,
+                wide("Account storage unavailable").as_ptr(),
+            );
+            Vec::new()
+        }
+    };
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        submenu as usize,
+        wide("Accounts (experimental)").as_ptr(),
+    );
+    accounts
 }
 
 fn quota_value(quota: Option<&QuotaWindow>) -> String {
@@ -1054,21 +1288,29 @@ unsafe fn draw_flyout(hwnd: HWND) {
         dpi as i32,
     );
 
-    let (footer, reset_badge) = match &snapshot.status {
-        Status::Error(error) => (error.clone(), String::new()),
-        _ => (
-            plan_badge(&snapshot),
-            snapshot
-                .usage
-                .reset_credits
-                .map(|count| format!("Reset x{count}"))
-                .unwrap_or_default(),
-        ),
+    let (footer, reset_badge) = if let Some(message) = &snapshot.account_feedback {
+        (message.clone(), String::new())
+    } else {
+        match &snapshot.status {
+            Status::Error(error) => (error.clone(), String::new()),
+            _ => (
+                plan_badge(&snapshot),
+                snapshot
+                    .usage
+                    .reset_credits
+                    .map(|count| format!("Reset x{count}"))
+                    .unwrap_or_default(),
+            ),
+        }
     };
     let mut footer_rect = RECT {
         left,
         top: scale(162),
-        right: scale(150),
+        right: if snapshot.account_feedback.is_some() {
+            right
+        } else {
+            scale(150)
+        },
         bottom: scale(181),
     };
     paint_text(dc, secondary_font, body, &footer, &mut footer_rect, common);
@@ -1227,12 +1469,18 @@ unsafe fn position_flyout(widget: HWND, flyout: HWND) {
 
     let dpi = GetDpiForWindow(widget).max(96) as i32;
     let mut width = 320 * dpi / 96;
-    if ACCOUNT_VISIBLE.load(Ordering::Acquire) {
+    if ACCOUNT_VISIBLE.load(Ordering::Acquire)
+        || STATE
+            .get()
+            .and_then(|state| state.lock().ok())
+            .is_some_and(|state| state.account_feedback.is_some())
+    {
         if let Some(state) = STATE.get().and_then(|state| state.lock().ok()) {
-            let text = wide(&format!(
+            let account_text = format!(
                 "Last account: {}",
-                account_display(&state.account, true)
-            ));
+                account_display(&state.account, ACCOUNT_VISIBLE.load(Ordering::Acquire))
+            );
+            let text = wide(state.account_feedback.as_deref().unwrap_or(&account_text));
             let dc = GetDC(widget);
             let font = create_font(dpi as u32, 14, FW_NORMAL);
             let old_font = SelectObject(dc, font);
@@ -1321,6 +1569,14 @@ unsafe fn hide_flyout_if_outside() {
     if widget != 0 {
         KillTimer(widget, TIMER_HIDE_FLYOUT);
     }
+    // Keep successful operation feedback readable without a confirmation click.
+    if STATE
+        .get()
+        .and_then(|state| state.lock().ok())
+        .is_some_and(|state| state.account_feedback.is_some())
+    {
+        return;
+    }
 
     let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
     let mut cursor: POINT = zeroed();
@@ -1408,6 +1664,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         MENU_OPEN_USAGE as usize,
         open_usage.as_ptr(),
     );
+    let account_choices = append_account_menu(menu);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(
         menu,
@@ -1449,7 +1706,17 @@ unsafe fn show_context_menu(hwnd: HWND) {
         acrylic_taskbar_label.as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, MENU_EXIT as usize, exit.as_ptr());
+    AppendMenuW(
+        menu,
+        MF_STRING
+            | if ACCOUNT_OPERATION.load(Ordering::Acquire) {
+                MF_GRAYED
+            } else {
+                0
+            },
+        MENU_EXIT as usize,
+        exit.as_ptr(),
+    );
 
     let mut cursor: POINT = zeroed();
     GetCursorPos(&mut cursor);
@@ -1466,6 +1733,30 @@ unsafe fn show_context_menu(hwnd: HWND) {
     DestroyMenu(menu);
 
     match command as i32 {
+        MENU_SAVE_ACCOUNT => begin_account_action(AccountAction::Save),
+        MENU_IMPORT_CODEX_AUTH => begin_account_action(AccountAction::ImportCodexAuth),
+        MENU_IMPORT_ACCOUNT => {
+            if let Some(path) = select_auth_file(hwnd) {
+                begin_account_action(AccountAction::Import(path));
+            }
+        }
+        MENU_RESTORE_ACCOUNT => {
+            if confirm_restore(hwnd) {
+                begin_account_action(AccountAction::Restore);
+            }
+        }
+        id if id >= MENU_ACCOUNT_FIRST
+            && (id - MENU_ACCOUNT_FIRST) < account_choices.len() as i32 =>
+        {
+            let index = (id - MENU_ACCOUNT_FIRST) as usize;
+            let account = &account_choices[index];
+            let target = account
+                .label(ACCOUNT_VISIBLE.load(Ordering::Acquire), index)
+                .replace("&&", "&");
+            if confirm_switch(hwnd, &target) {
+                begin_account_action(AccountAction::Switch(account.key.clone()));
+            }
+        }
         MENU_REFRESH => trigger_refresh(),
         MENU_OPEN_USAGE => open_usage_dashboard(hwnd),
         MENU_STARTUP => {
@@ -1476,6 +1767,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
             if enabled {
                 if taskbar::apply_centered() && taskbar::set_preference(true).is_ok() {
                     TASKBAR_CENTERED.store(true, Ordering::Release);
+                } else {
+                    taskbar::restore_left();
                 }
             } else if taskbar::set_preference(false).is_ok() {
                 TASKBAR_CENTERED.store(false, Ordering::Release);
@@ -1596,6 +1889,22 @@ unsafe extern "system" fn widget_window_proc(
             hide_flyout_if_outside();
             0
         }
+        WM_TIMER if wparam == TIMER_ACCOUNT_FEEDBACK => {
+            KillTimer(hwnd, TIMER_ACCOUNT_FEEDBACK);
+            if let Some(state) = STATE.get().and_then(|state| state.lock().ok()) {
+                let mut state = state;
+                state.account_feedback = None;
+            }
+            let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
+            if flyout != 0 {
+                InvalidateRect(flyout, null(), 1);
+                if IsWindowVisible(flyout) != 0 {
+                    position_flyout(hwnd, flyout);
+                }
+            }
+            hide_flyout_if_outside();
+            0
+        }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             position_widget(hwnd);
             if TASKBAR_CENTERED.load(Ordering::Acquire) {
@@ -1618,6 +1927,55 @@ unsafe extern "system" fn widget_window_proc(
             }
             if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
                 taskbar::apply_acrylic();
+            }
+            if REFRESH_PENDING.swap(false, Ordering::AcqRel) {
+                trigger_refresh();
+            }
+            0
+        }
+        WM_ACCOUNT_DONE => {
+            if wparam != 0 {
+                if let Some(state) = STATE.get() {
+                    if let Ok(mut state) = state.lock() {
+                        state.status = Status::Loading;
+                        state.usage = UsageSnapshot::default();
+                        state.account = rpc::AccountSummary::default();
+                        state.updated_at = None;
+                    }
+                }
+                // Newly selected identities start hidden again.
+                ACCOUNT_VISIBLE.store(false, Ordering::Release);
+                InvalidateRect(hwnd, null(), 1);
+                let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
+                if flyout != 0 {
+                    InvalidateRect(flyout, null(), 1);
+                }
+            }
+            ACCOUNT_OPERATION.store(false, Ordering::Release);
+            let notice = ACCOUNT_NOTICE
+                .lock()
+                .ok()
+                .and_then(|mut notice| notice.take());
+            if let Some((message, failed)) = notice {
+                if failed {
+                    MessageBoxW(
+                        hwnd,
+                        wide(&message).as_ptr(),
+                        wide("HiCodex accounts").as_ptr(),
+                        MB_ICONWARNING,
+                    );
+                } else {
+                    if let Some(state) = STATE.get().and_then(|state| state.lock().ok()) {
+                        let mut state = state;
+                        state.account_feedback = Some(message);
+                    }
+                    SetTimer(hwnd, TIMER_ACCOUNT_FEEDBACK, ACCOUNT_FEEDBACK_MS, None);
+                    show_flyout(hwnd);
+                }
+            }
+            let pending = REFRESH_PENDING.swap(false, Ordering::AcqRel);
+            if wparam != 0 || pending {
+                trigger_refresh();
             }
             0
         }
