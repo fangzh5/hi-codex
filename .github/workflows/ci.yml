@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, codex/experimental-account-switching]
+    tags: ['v*-beta.*']
   pull_request:
 
 permissions:
@@ -30,3 +31,44 @@ jobs:
           name: HiCodex-windows-x64
           path: target/release/hicodex.exe
           if-no-files-found: error
+
+  prerelease:
+    if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-beta.')
+    needs: windows
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: HiCodex-windows-x64
+          path: artifact
+      - name: Package prerelease
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $notes = "docs/releases/$tag.md"
+          if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) {
+            throw "Missing release notes: $notes"
+          }
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item -LiteralPath artifact/hicodex.exe -Destination package/HiCodex.exe
+          Copy-Item -LiteralPath LICENSE -Destination package/LICENSE
+          Copy-Item -LiteralPath $notes -Destination package/README.md
+          $zip = "HiCodex-$tag-windows-x64.zip"
+          Compress-Archive -LiteralPath package/HiCodex.exe,package/LICENSE,package/README.md -DestinationPath $zip
+          $checksums = @(
+            "$( (Get-FileHash -LiteralPath package/HiCodex.exe -Algorithm SHA256).Hash.ToLowerInvariant() )  HiCodex.exe"
+            "$( (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() )  $zip"
+          )
+          $checksums | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+      - name: Publish experimental release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --prerelease --latest=false --title "HiCodex $tag (experimental)" --notes-file "docs/releases/$tag.md"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
