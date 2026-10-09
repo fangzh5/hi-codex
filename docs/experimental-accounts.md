@@ -1,6 +1,6 @@
-# Experimental account switching
+# Optional account switching
 
-Branch: `codex/experimental-account-switching`. Version: `v0.3.3-beta.1`. This is a native opt-in prerelease, not a stable release. Real-account desktop acceptance testing below remains required before stable promotion; automated tests do not substitute for it.
+Included in the main branch starting with `v0.4.0`, after development on `codex/experimental-account-switching`. Account management remains opt-in. The checklist below records scenarios requiring ongoing acceptance testing, not completed certification; automated tests do not substitute for real-account desktop verification.
 
 ## Boundaries
 
@@ -34,7 +34,7 @@ Imports preserve existing local snapshots, use registry aliases when available, 
 
 Automated tests use synthetic JWTs and isolated temporary homes, never the user's real login. Coverage includes hidden aliases, distinct same-email workspace labels, partial directory import, all-or-nothing JSON import, retained duplicate credentials, missing/malformed-auth recovery, rejected new logins and inaccessible files, read-only missing-store fallback, DPAPI corruption, locked-file failure, injected partial replacement and rollback failures, concurrent file creation, and taskbar position ownership. These tests exercise Windows DPAPI and native file operations; rare replacement failures are injected at the native replacement boundary.
 
-Manual acceptance before stable release:
+Manual acceptance checklist (not all scenarios have been verified):
 
 1. Launch without saved accounts: quotas still refresh and no account directory is created.
 2. Save a real file-mode ChatGPT account; restart HiCodex and verify its masked menu entry.

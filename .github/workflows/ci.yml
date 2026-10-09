@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main, codex/experimental-account-switching]
-    tags: ['v*-beta.*']
+    tags: ['v*.*.*']
   pull_request:
 
 permissions:
@@ -32,23 +32,36 @@ jobs:
           path: target/release/hicodex.exe
           if-no-files-found: error
 
-  prerelease:
-    if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-beta.')
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: windows
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: HiCodex-windows-x64
           path: artifact
-      - name: Package prerelease
+      - name: Validate release and package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
+            throw "Unsupported release tag: $tag"
+          }
+          if ($tag -notmatch '-beta\.') {
+            git merge-base --is-ancestor HEAD origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'Stable releases must be merged into main first.' }
+          }
+          $manifest = Get-Content -LiteralPath Cargo.toml -Raw
+          if ($manifest -notmatch ('(?m)^version = "' + [regex]::Escape($tag.Substring(1)) + '"$')) {
+            throw 'Tag and package version do not match.'
+          }
           $notes = "docs/releases/$tag.md"
           if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) {
             throw "Missing release notes: $notes"
@@ -64,11 +77,15 @@ jobs:
             "$( (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() )  $zip"
           )
           $checksums | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
-      - name: Publish experimental release
+      - name: Publish release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --prerelease --latest=false --title "HiCodex $tag (experimental)" --notes-file "docs/releases/$tag.md"
+          if ($tag -match '-beta\.') {
+            gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --prerelease --latest=false --title "HiCodex $tag (experimental)" --notes-file "docs/releases/$tag.md"
+          } else {
+            gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --latest --title "HiCodex $tag" --notes-file "docs/releases/$tag.md"
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

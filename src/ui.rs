@@ -45,7 +45,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HWND_TOP, HWND_TOPMOST, IDC_ARROW, IDYES, LWA_ALPHA, MA_NOACTIVATE, MB_DEFBUTTON2,
     MB_ICONWARNING, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND,
+    TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
     WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE,
     WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     WS_VISIBLE,
@@ -388,12 +388,7 @@ unsafe fn append_account_menu(menu: HMENU) -> Vec<accounts::Account> {
             Vec::new()
         }
     };
-    AppendMenuW(
-        menu,
-        MF_POPUP,
-        submenu as usize,
-        wide("Accounts (experimental)").as_ptr(),
-    );
+    AppendMenuW(menu, MF_POPUP, submenu as usize, wide("Accounts").as_ptr());
     accounts
 }
 
@@ -1867,9 +1862,14 @@ unsafe extern "system" fn widget_window_proc(
             position_widget(hwnd);
             if TASKBAR_CENTERED.load(Ordering::Acquire) {
                 taskbar::apply_centered();
+            } else {
+                taskbar::restore_left();
             }
             if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
                 taskbar::apply_acrylic();
+            } else {
+                // Retry failed restores without a new worker or timer.
+                taskbar::restore_acrylic();
             }
             0
         }
@@ -1905,7 +1905,7 @@ unsafe extern "system" fn widget_window_proc(
             hide_flyout_if_outside();
             0
         }
-        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => {
             position_widget(hwnd);
             if TASKBAR_CENTERED.load(Ordering::Acquire) {
                 taskbar::apply_centered();
@@ -2182,8 +2182,10 @@ pub fn run() {
         if TASKBAR_CENTERED.load(Ordering::Acquire) {
             taskbar::apply_centered();
         }
-        if TASKBAR_ACRYLIC.load(Ordering::Acquire) && !taskbar::apply_acrylic() {
-            TASKBAR_ACRYLIC.store(false, Ordering::Release);
+        if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
+            // Explorer can be mid-rebuild during startup/RDP reconnect. Keep
+            // the preference and let the existing timer retry transient failures.
+            taskbar::apply_acrylic();
         }
         trigger_refresh();
         #[cfg(debug_assertions)]
