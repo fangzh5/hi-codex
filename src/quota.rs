@@ -92,7 +92,24 @@ pub fn parse_rate_limit_response(response: &Value) -> Result<UsageSnapshot, Stri
         .ok_or_else(|| "Rate-limit response did not contain a result".to_owned())?;
 
     let mut collected = Vec::new();
-    collect_windows(result, &mut collected);
+    // Select the Codex bucket before inspecting windows. Never combine windows
+    // from different model buckets just because their durations match.
+    let bucket = result
+        .get("rateLimitsByLimitId")
+        .and_then(|buckets| buckets.get("codex"))
+        .filter(|bucket| bucket.is_object())
+        .or_else(|| {
+            result.get("rateLimits").filter(|bucket| {
+                bucket.is_object()
+                    && bucket
+                        .get("limitId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| id == "codex")
+            })
+        });
+    if let Some(bucket) = bucket {
+        collect_windows(bucket, &mut collected);
+    }
 
     let mut seen = HashSet::new();
     collected.retain(|window| {
@@ -131,6 +148,26 @@ pub fn parse_rate_limit_response(response: &Value) -> Result<UsageSnapshot, Stri
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn chooses_codex_bucket_without_mixing_model_limits() {
+        let window = |used, minutes| json!({"usedPercent": used, "windowDurationMins": minutes, "resetsAt": 2000000000});
+        let response = json!({"result": {
+            "rateLimits": {"primary": window(90, 300)},
+            "rateLimitsByLimitId": {
+                "a_other_model": {"primary": window(99, 300), "secondary": window(99, 10080)},
+                "codex": {"primary": window(20, 300), "secondary": null}
+            }
+        }});
+        let snapshot = parse_rate_limit_response(&response).unwrap();
+        assert_eq!(snapshot.five_hour.unwrap().remaining_percent(), 80);
+        assert!(snapshot.weekly.is_none());
+        assert!(snapshot.other.is_empty());
+        assert!(parse_rate_limit_response(&json!({"result": {
+            "rateLimitsByLimitId": {"a_other_model": {"primary": window(99, 300)}}
+        }}))
+        .is_err());
+    }
 
     #[test]
     fn parses_five_hour_and_weekly_windows_by_duration() {

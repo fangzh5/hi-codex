@@ -6,3 +6,19 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 /release/
+
+# Local authentication and account data (including nested copies)
+auth.json
+*.auth.json
+accounts.json
+*.dpapi
+.codex/
+*.hicodex-backup
+.hicodex-*.tmp
+
+# Local environment secrets; keep templates trackable
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template

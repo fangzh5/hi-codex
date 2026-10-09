@@ -12,6 +12,30 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex limits with
 
 **[下载最新版 / Download latest](../../releases/latest)**
 
+### 可选账号切换（v0.4.0）
+
+`v0.4.0` 将账号管理并入正式版，不依赖 codex-auth、Node.js 或 codext。[下载正式版](https://github.com/fangzh5/hi-codex/releases/tag/v0.4.0)。单账号用户可以继续只查看额度，无需配置账号库。
+
+- 原有额度查看无需启用多账号，也不会自动创建账号库。
+- 右键菜单 **Accounts** → **Save current account** 保存当前登录账号。添加另一个账号时，先在 Codex 正常登录，再保存。
+- 已使用 codex-auth：选择 **Import existing codex-auth accounts**，从同一个 `CODEX_HOME` 读取已登记的 ChatGPT 快照及别名，不修改它的文件或当前登录。也可通过 **Import auth JSON...** 导入 Codex 生成的 `auth.json`；这是内部凭据格式，并非保证长期兼容的公开标准，不支持 CPA 格式或 API Key 账号。
+- 账号菜单默认隐藏邮箱、别名和工作区；在悬停面板点击眼睛按钮后可显示身份。每个账号保留独立编号，并显示工作区短标识，便于区分同邮箱账号。
+- 当前选中的账号带勾且不可重复点击。保存、导入和切换成功后，结果在详情面板显示约 8 秒，无需点击“确定”；切换与恢复前仍需确认，失败时保留具体错误提示。
+- 在子菜单点击账号后，先关闭 Codex 和其他账号切换工具，核对确认框中的目标，再手动重新打开 Codex。本地选择保存后，HiCodex 自动刷新额度验证访问，并重新隐藏账号身份。
+- **Restore last switch backup** 可恢复最近一次切换前的凭据，也支持当前凭据文件缺失或 JSON 语法损坏的情况；检测到后续有效登录或凭据刷新时会拒绝覆盖，此时使用账号菜单重新选择。权限不足和无法读取文件不会被视为文件损坏。
+- 独立账号库保存在 `$CODEX_HOME/hi-codex/accounts.dpapi`，使用 Windows DPAPI 绑定当前 Windows 用户加密，包含凭据与最近一次恢复备份。不能作为跨机器迁移文件；原始导入文件仍需自行妥善保管。
+- 首版限 Windows 原生、ChatGPT 文件凭据模式。显式 `keyring`、`auto`、`ephemeral`、WSL 和环境凭据覆盖会阻止切换，不影响额度查看。未设置凭据存储模式时按 Codex 的默认文件模式处理；不会修改你的 Codex 配置。
+- 导入是一次性复制，账号库和别名不自动同步，重复导入不覆盖已有快照。请不要交替使用多个管理器操作同一组旧快照，刷新后的凭据可能让其他副本失效；需要时重新在 Codex 登录并保存当前账号。
+- codex-auth 导入会跳过损坏、不支持、未登记和重复的快照，并显示新增与跳过数量；手动选择的 JSON 批量文件仍须全部有效才会导入。
+- 文件替换失败时保留恢复副本，必要时自动还原原文件；账号库主文件缺失时可读取恢复副本。正常写入完成后会清理副本，异常中断遗留的 `.hicodex-backup` 与 `.hicodex-*.tmp` 文件可能包含凭据，应妥善保管。
+- 非法或损坏的账号库只影响账号管理；额度查看继续走原有 App Server 接口。跨账号对话接续、企业策略和真实 RDP 场景尚未完整验收，请先保存工作再切换。
+
+Account management is included in [v0.4.0](https://github.com/fangzh5/hi-codex/releases/tag/v0.4.0), remains opt-in, and is independent of codex-auth. Use **Accounts** to save the current ChatGPT login, import Codex-generated auth JSON or registered codex-auth snapshots, switch accounts, or restore the last switch backup. Close Codex and other switchers before switching and reopen Codex manually. Snapshots use Windows user-scoped DPAPI. Only Windows-native ChatGPT file credentials are supported; API keys, WSL and keyring/auto/ephemeral modes are not. Imports leave the active login and existing snapshots unchanged. Cross-account conversation continuation, enterprise policy and real RDP sessions are not fully validated.
+
+Taskbar centering now bounds icon placement to its actual parent; insufficient space falls back to the previous position. Acrylic recovery retains failed operations for retry and avoids restoring over a different external style. If the original style cannot be read, HiCodex keeps the system style instead of forcing transparency. Secondary-monitor acrylic and real RDP behavior are not guaranteed. No additional background thread, timer or dependency was introduced for these fixes.
+
+任务栏居中增加父窗口边界检查，空间不足时恢复原位置；半透明恢复失败会保留记录重试，不覆盖不同的外部样式。无法读取原始样式时保留系统效果，不强制透明。副屏毛玻璃和真实 RDP 场景不保证完全支持。本次任务栏修复没有增加后台线程、定时器或依赖。
+
 <p align="center">
   <img src="assets/screenshots/taskbar.png" alt="HiCodex taskbar display" width="478">
 </p>
