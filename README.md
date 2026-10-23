@@ -12,12 +12,22 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex limits with
 
 **[下载最新版 / Download latest](../../releases/latest)**
 
-### 可选账号切换（v0.4.0）
+### v0.4.1 更新 / What's new
 
-`v0.4.0` 将账号管理并入正式版，不依赖 codex-auth、Node.js 或 codext。[下载正式版](https://github.com/fangzh5/hi-codex/releases/tag/v0.4.0)。单账号用户可以继续只查看额度，无需配置账号库。
+`v0.4.1` 修复任务栏居中闪烁和桌面端换账号后的保存流程。[下载正式版](https://github.com/fangzh5/hi-codex/releases/tag/v0.4.1)。
+
+- **居中稳定性：** 在 Windows 原生任务栏容器中预留左侧留白，图标列表保持系统布局位置。Explorer 在托盘图标增删时重置列表，也会保留这段留白。布局事件用于更新所需留白；短暂读不到图标时保留最近的有效尺寸。原有两秒检查继续用于恢复保障，没有常驻快速轮询。
+- **桌面端换账号后保存：** 先短暂等待登录文件写入。若桌面端已登录但没有可保存的文件凭据，会提供浏览器授权保存入口；也可直接选择 **Accounts → Sign in and save account...** 添加账号。请在浏览器选择要保存的账号。授权在独立临时目录完成，成功后加密存入账号库，保留当前桌面登录及已存账号。可通过 **Cancel account sign-in** 取消，三分钟未完成会超时。
+- **登出后选择账号：** 当前登录文件被删除时，仍可关闭 Codex 后选择已存账号；不会把旧的恢复备份当作本次登出前的账号。
+
+Version 0.4.1 uses persistent native task-band header space for centering, so Explorer can reset its inner icon list without removing that space. It also adds browser authorization to save accounts when the desktop has no file credentials, and selection of saved accounts after logout. Browser sign-in saves a separate encrypted snapshot without changing the desktop login. See [account behavior](docs/experimental-accounts.md) and [taskbar validation](docs/taskbar-validation.md) for verification limits.
+
+### 可选账号切换
+
+账号管理自 `v0.4.0` 起并入正式版，不依赖 codex-auth、Node.js 或 codext。单账号用户可以继续只查看额度，无需配置账号库。
 
 - 原有额度查看无需启用多账号，也不会自动创建账号库。
-- 右键菜单 **Accounts** → **Save current account** 保存当前登录账号。添加另一个账号时，先在 Codex 正常登录，再保存。
+- 右键菜单 **Accounts** → **Save current account** 保存当前文件登录；**Sign in and save account...** 可通过浏览器添加另一个账号，不必登出桌面端。
 - 已使用 codex-auth：选择 **Import existing codex-auth accounts**，从同一个 `CODEX_HOME` 读取已登记的 ChatGPT 快照及别名，不修改它的文件或当前登录。也可通过 **Import auth JSON...** 导入 Codex 生成的 `auth.json`；这是内部凭据格式，并非保证长期兼容的公开标准，不支持 CPA 格式或 API Key 账号。
 - 账号菜单默认隐藏邮箱、别名和工作区；在悬停面板点击眼睛按钮后可显示身份。每个账号保留独立编号，并显示工作区短标识，便于区分同邮箱账号。
 - 当前选中的账号带勾且不可重复点击。保存、导入和切换成功后，结果在详情面板显示约 8 秒，无需点击“确定”；切换与恢复前仍需确认，失败时保留具体错误提示。
@@ -30,11 +40,11 @@ HiCodex is a lightweight, unofficial Windows taskbar meter for Codex limits with
 - 文件替换失败时保留恢复副本，必要时自动还原原文件；账号库主文件缺失时可读取恢复副本。正常写入完成后会清理副本，异常中断遗留的 `.hicodex-backup` 与 `.hicodex-*.tmp` 文件可能包含凭据，应妥善保管。
 - 非法或损坏的账号库只影响账号管理；额度查看继续走原有 App Server 接口。跨账号对话接续、企业策略和真实 RDP 场景尚未完整验收，请先保存工作再切换。
 
-Account management is included in [v0.4.0](https://github.com/fangzh5/hi-codex/releases/tag/v0.4.0), remains opt-in, and is independent of codex-auth. Use **Accounts** to save the current ChatGPT login, import Codex-generated auth JSON or registered codex-auth snapshots, switch accounts, or restore the last switch backup. Close Codex and other switchers before switching and reopen Codex manually. Snapshots use Windows user-scoped DPAPI. Only Windows-native ChatGPT file credentials are supported; API keys, WSL and keyring/auto/ephemeral modes are not. Imports leave the active login and existing snapshots unchanged. Cross-account conversation continuation, enterprise policy and real RDP sessions are not fully validated.
+Account management remains opt-in and independent of codex-auth. Use **Accounts** to save the current file login, authorize and save an additional account in your browser, import Codex-generated auth JSON or registered codex-auth snapshots, switch accounts, or restore the last switch backup. Close Codex and other switchers before switching and reopen Codex manually. Snapshots use Windows user-scoped DPAPI. Only Windows-native ChatGPT file credentials are supported; API keys, WSL and keyring/auto/ephemeral modes are not. Imports leave the active login and existing snapshots unchanged. Cross-account conversation continuation, enterprise policy and real RDP sessions are not fully validated.
 
-Taskbar centering now bounds icon placement to its actual parent; insufficient space falls back to the previous position. Acrylic recovery retains failed operations for retry and avoids restoring over a different external style. If the original style cannot be read, HiCodex keeps the system style instead of forcing transparency. Secondary-monitor acrylic and real RDP behavior are not guaranteed. No additional background thread, timer or dependency was introduced for these fixes.
+Centered icons respect native container boundaries and the space reserved for right-side controls. Insufficient space restores the original native header. Acrylic recovery retains failed operations for retry and avoids restoring over a different external style. If the original style cannot be read, HiCodex keeps the system style. Secondary-monitor acrylic and real RDP behavior are not guaranteed.
 
-任务栏居中增加父窗口边界检查，空间不足时恢复原位置；半透明恢复失败会保留记录重试，不覆盖不同的外部样式。无法读取原始样式时保留系统效果，不强制透明。副屏毛玻璃和真实 RDP 场景不保证完全支持。本次任务栏修复没有增加后台线程、定时器或依赖。
+居中会遵守原生容器边界及右侧控件的预留空间，空间不足时恢复原生留白；半透明恢复失败会保留记录重试，不覆盖不同的外部样式。无法读取原始样式时保留系统效果。副屏毛玻璃和真实 RDP 场景不保证完全支持。
 
 <p align="center">
   <img src="assets/screenshots/taskbar.png" alt="HiCodex taskbar display" width="478">

@@ -38,17 +38,17 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, FindWindowExW, FindWindowW, GetClientRect, GetCursorPos, GetMessageW,
-    GetParent, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes, SetParent,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
-    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_EXSTYLE, GWL_STYLE, HMENU,
-    HWND_TOP, HWND_TOPMOST, IDC_ARROW, IDYES, LWA_ALPHA, MA_NOACTIVATE, MB_DEFBUTTON2,
-    MB_ICONWARNING, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-    WS_VISIBLE,
+    GetParent, GetWindow, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes,
+    SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+    TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_EXSTYLE,
+    GWL_STYLE, GW_HWNDPREV, HMENU, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IDYES, LWA_ALPHA,
+    MA_NOACTIVATE, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
+    SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
 const WIDGET_CLASS_NAME: &str = "HiCodex.TaskbarWidget";
@@ -60,6 +60,7 @@ const TIMER_HIDE_FLYOUT: usize = 3;
 const TIMER_HOVER_POLL: usize = 4;
 const TIMER_SYSTEM_USAGE: usize = 5;
 const TIMER_ACCOUNT_FEEDBACK: usize = 6;
+const TIMER_LAYOUT_SETTLE: usize = 7;
 const ACCOUNT_FEEDBACK_MS: u32 = 8_000;
 const POSITION_INTERVAL_MS: u32 = 2_000;
 const SYSTEM_USAGE_INTERVAL_MS: u32 = 2_000;
@@ -71,6 +72,7 @@ const HOVER_SHOW_TICKS: u32 = 3;
 const HOVER_HIDE_TICKS: u32 = 3;
 const WM_REFRESHED: u32 = WM_APP + 1;
 const WM_ACCOUNT_DONE: u32 = WM_APP + 2;
+const WM_TASKBAR_LAYOUT: u32 = WM_APP + 3;
 
 const MENU_REFRESH: i32 = 1001;
 const MENU_OPEN_USAGE: i32 = 1002;
@@ -83,6 +85,8 @@ const MENU_SAVE_ACCOUNT: i32 = 1010;
 const MENU_IMPORT_ACCOUNT: i32 = 1011;
 const MENU_IMPORT_CODEX_AUTH: i32 = 1012;
 const MENU_RESTORE_ACCOUNT: i32 = 1013;
+const MENU_SIGN_IN_ACCOUNT: i32 = 1014;
+const MENU_CANCEL_SIGN_IN: i32 = 1015;
 const MENU_ACCOUNT_FIRST: i32 = 2000;
 
 static STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
@@ -92,6 +96,9 @@ static FLYOUT_GLASS: AtomicBool = AtomicBool::new(false);
 static REFRESHING: AtomicBool = AtomicBool::new(false);
 static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 static ACCOUNT_OPERATION: AtomicBool = AtomicBool::new(false);
+static ACCOUNT_LOGIN_REQUIRED: AtomicBool = AtomicBool::new(false);
+static ACCOUNT_LOGIN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ACCOUNT_LOGIN_CANCEL: AtomicBool = AtomicBool::new(false);
 // Serialize credential mutations against this process's App Server readers.
 static AUTH_GATE: Mutex<()> = Mutex::new(());
 static ACCOUNT_NOTICE: Mutex<Option<(String, bool)>> = Mutex::new(None);
@@ -194,6 +201,7 @@ fn trigger_refresh() {
 
 enum AccountAction {
     Save,
+    SignIn,
     Import(std::path::PathBuf),
     ImportCodexAuth,
     Switch(String),
@@ -204,6 +212,12 @@ fn begin_account_action(action: AccountAction) {
     if ACCOUNT_OPERATION.swap(true, Ordering::AcqRel) {
         return;
     }
+    ACCOUNT_LOGIN_REQUIRED.store(false, Ordering::Release);
+    let signing_in = matches!(&action, AccountAction::SignIn);
+    if signing_in {
+        ACCOUNT_LOGIN_CANCEL.store(false, Ordering::Release);
+        ACCOUNT_LOGIN_ACTIVE.store(true, Ordering::Release);
+    }
     std::thread::spawn(move || {
         let changes_auth = matches!(&action, AccountAction::Switch(_) | AccountAction::Restore);
         let result = (|| {
@@ -212,9 +226,39 @@ fn begin_account_action(action: AccountAction) {
                 .map_err(|_| "Account operation lock is unavailable".to_owned())?;
             let manager = accounts::AccountManager::current()?;
             match action {
-                AccountAction::Save => {
-                    manager.save_current()?;
-                    Ok(("Account saved.".to_owned(), false))
+                AccountAction::Save => match manager.save_current()? {
+                    accounts::SaveCurrent::Saved => Ok(("Account saved.".to_owned(), true)),
+                    accounts::SaveCurrent::LoginRequired => {
+                        ACCOUNT_LOGIN_REQUIRED.store(true, Ordering::Release);
+                        Ok((String::new(), true))
+                    }
+                },
+                AccountAction::SignIn => {
+                    manager.sign_in_and_save(&ACCOUNT_LOGIN_CANCEL, |home| {
+                        rpc::sign_in(
+                            home,
+                            |url| unsafe {
+                                let opened = ShellExecuteW(
+                                    0,
+                                    wide("open").as_ptr(),
+                                    wide(url).as_ptr(),
+                                    null(),
+                                    null(),
+                                    SW_SHOW,
+                                );
+                                if opened > 32 {
+                                    Ok(())
+                                } else {
+                                    Err("Could not open the browser for sign-in".into())
+                                }
+                            },
+                            &ACCOUNT_LOGIN_CANCEL,
+                        )
+                    })?;
+                    Ok((
+                        "Account saved. Select it in Accounts to switch.".to_owned(),
+                        false,
+                    ))
                 }
                 AccountAction::Import(path) => {
                     let count = manager.import_file(&path)?;
@@ -252,8 +296,13 @@ fn begin_account_action(action: AccountAction) {
             Ok((message, changed)) => (message, changed, false),
             // A post-commit verification failure may have changed auth. Always
             // re-read after attempted writes instead of showing the old quota.
-            Err(error) => (error, changes_auth, true),
+            Err(error) => (
+                error,
+                changes_auth,
+                !(signing_in && ACCOUNT_LOGIN_CANCEL.load(Ordering::Acquire)),
+            ),
         };
+        ACCOUNT_LOGIN_ACTIVE.store(false, Ordering::Release);
         if let Ok(mut notice) = ACCOUNT_NOTICE.lock() {
             *notice = Some((message, failed));
         }
@@ -330,6 +379,20 @@ unsafe fn append_account_menu(menu: HMENU) -> Vec<accounts::Account> {
         MENU_SAVE_ACCOUNT as usize,
         wide("Save current account").as_ptr(),
     );
+    AppendMenuW(
+        submenu,
+        flags,
+        MENU_SIGN_IN_ACCOUNT as usize,
+        wide("Sign in and save account...").as_ptr(),
+    );
+    if ACCOUNT_LOGIN_ACTIVE.load(Ordering::Acquire) {
+        AppendMenuW(
+            submenu,
+            MF_STRING,
+            MENU_CANCEL_SIGN_IN as usize,
+            wide("Cancel account sign-in").as_ptr(),
+        );
+    }
     AppendMenuW(
         submenu,
         flags,
@@ -977,20 +1040,39 @@ unsafe fn position_widget(hwnd: HWND) {
     }
     .max(0);
 
-    SetWindowPos(
-        hwnd,
-        HWND_TOP,
-        x,
-        y,
-        width,
-        height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    );
-    ShowWindow(hwnd, SW_SHOW);
+    let mut current: RECT = zeroed();
+    if GetWindowRect(hwnd, &mut current) == 0
+        || current.left != tray_rect.left + x
+        || current.top != tray_rect.top + y
+        || current.right - current.left != width
+        || current.bottom - current.top != height
+        || IsWindowVisible(hwnd) == 0
+        || GetWindow(hwnd, GW_HWNDPREV) != 0
+    {
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
 
     let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
     if flyout != 0 && IsWindowVisible(flyout) != 0 {
         position_flyout(hwnd, flyout);
+    }
+}
+
+unsafe fn update_taskbar_centering(hwnd: HWND) {
+    if TASKBAR_CENTERED.load(Ordering::Acquire) {
+        taskbar::watch_layout(hwnd, WM_TASKBAR_LAYOUT);
+        taskbar::apply_centered();
+    } else {
+        taskbar::stop_layout_watch();
+        taskbar::restore_left();
     }
 }
 
@@ -1729,6 +1811,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
 
     match command as i32 {
         MENU_SAVE_ACCOUNT => begin_account_action(AccountAction::Save),
+        MENU_SIGN_IN_ACCOUNT => begin_account_action(AccountAction::SignIn),
+        MENU_CANCEL_SIGN_IN => ACCOUNT_LOGIN_CANCEL.store(true, Ordering::Release),
         MENU_IMPORT_CODEX_AUTH => begin_account_action(AccountAction::ImportCodexAuth),
         MENU_IMPORT_ACCOUNT => {
             if let Some(path) = select_auth_file(hwnd) {
@@ -1759,15 +1843,16 @@ unsafe fn show_context_menu(hwnd: HWND) {
         }
         MENU_CENTER_TASKBAR => {
             let enabled = !TASKBAR_CENTERED.load(Ordering::Acquire);
-            if enabled {
-                if taskbar::apply_centered() && taskbar::set_preference(true).is_ok() {
-                    TASKBAR_CENTERED.store(true, Ordering::Release);
-                } else {
-                    taskbar::restore_left();
-                }
-            } else if taskbar::set_preference(false).is_ok() {
-                TASKBAR_CENTERED.store(false, Ordering::Release);
-                taskbar::restore_left();
+            if enabled && !taskbar::native_centering_available() {
+                MessageBoxW(
+                    hwnd,
+                    wide("Could not access the native Windows taskbar layout. Centering remains off. Run HiCodex in the same desktop session as Explorer and retry.").as_ptr(),
+                    wide("Taskbar centering unavailable").as_ptr(),
+                    MB_ICONWARNING,
+                );
+            } else if taskbar::set_preference(enabled).is_ok() {
+                TASKBAR_CENTERED.store(enabled, Ordering::Release);
+                update_taskbar_centering(hwnd);
             }
         }
         MENU_ACRYLIC_TASKBAR => {
@@ -1860,16 +1945,31 @@ unsafe extern "system" fn widget_window_proc(
         }
         WM_TIMER if wparam == TIMER_POSITION => {
             position_widget(hwnd);
-            if TASKBAR_CENTERED.load(Ordering::Acquire) {
-                taskbar::apply_centered();
-            } else {
-                taskbar::restore_left();
-            }
+            update_taskbar_centering(hwnd);
             if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
                 taskbar::apply_acrylic();
             } else {
                 // Retry failed restores without a new worker or timer.
                 taskbar::restore_acrylic();
+            }
+            0
+        }
+        WM_TASKBAR_LAYOUT => {
+            taskbar::acknowledge_layout_change();
+            if TASKBAR_CENTERED.load(Ordering::Acquire) {
+                position_widget(hwnd);
+                update_taskbar_centering(hwnd);
+                // One trailing pass catches delayed MSAA button geometry. This
+                // timer exists only during a layout burst, never as fast polling.
+                SetTimer(hwnd, TIMER_LAYOUT_SETTLE, 120, None);
+            }
+            0
+        }
+        WM_TIMER if wparam == TIMER_LAYOUT_SETTLE => {
+            KillTimer(hwnd, TIMER_LAYOUT_SETTLE);
+            if TASKBAR_CENTERED.load(Ordering::Acquire) {
+                position_widget(hwnd);
+                update_taskbar_centering(hwnd);
             }
             0
         }
@@ -1907,9 +2007,7 @@ unsafe extern "system" fn widget_window_proc(
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => {
             position_widget(hwnd);
-            if TASKBAR_CENTERED.load(Ordering::Acquire) {
-                taskbar::apply_centered();
-            }
+            update_taskbar_centering(hwnd);
             if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
                 taskbar::apply_acrylic();
             }
@@ -1922,9 +2020,7 @@ unsafe extern "system" fn widget_window_proc(
                 InvalidateRect(flyout, null(), 1);
             }
             position_widget(hwnd);
-            if TASKBAR_CENTERED.load(Ordering::Acquire) {
-                taskbar::apply_centered();
-            }
+            update_taskbar_centering(hwnd);
             if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
                 taskbar::apply_acrylic();
             }
@@ -1956,7 +2052,17 @@ unsafe extern "system" fn widget_window_proc(
                 .lock()
                 .ok()
                 .and_then(|mut notice| notice.take());
-            if let Some((message, failed)) = notice {
+            if ACCOUNT_LOGIN_REQUIRED.swap(false, Ordering::AcqRel) {
+                let answer = MessageBoxW(
+                    hwnd,
+                    wide("Codex has no saved file credentials for this login. A desktop sign-in may still be active.\n\nSign in in your browser to save this account in HiCodex? Choose the account you want to add. Your desktop login and existing saved accounts will be kept.\n\nYou can cancel from Accounts while the browser is open.").as_ptr(),
+                    wide("Save account with browser sign-in").as_ptr(),
+                    MB_YESNO | MB_ICONWARNING,
+                );
+                if answer == IDYES {
+                    begin_account_action(AccountAction::SignIn);
+                }
+            } else if let Some((message, failed)) = notice {
                 if failed {
                     MessageBoxW(
                         hwnd,
@@ -1980,6 +2086,8 @@ unsafe extern "system" fn widget_window_proc(
             0
         }
         WM_DESTROY => {
+            ACCOUNT_LOGIN_CANCEL.store(true, Ordering::Release);
+            taskbar::stop_layout_watch();
             taskbar::restore_left();
             taskbar::restore_acrylic();
             let flyout = FLYOUT_WINDOW.swap(0, Ordering::AcqRel);
@@ -2179,9 +2287,7 @@ pub fn run() {
             refresh_system_usage(hwnd);
         }
         position_widget(hwnd);
-        if TASKBAR_CENTERED.load(Ordering::Acquire) {
-            taskbar::apply_centered();
-        }
+        update_taskbar_centering(hwnd);
         if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
             // Explorer can be mid-rebuild during startup/RDP reconnect. Keep
             // the preference and let the existing timer retry transient failures.

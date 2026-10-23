@@ -3,6 +3,7 @@
 mod accounts;
 mod credential_storage;
 mod quota;
+mod rebar;
 mod rpc;
 mod startup;
 mod system_usage;
@@ -18,6 +19,16 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 fn main() {
+    if std::env::args().any(|argument| argument == "--taskbar-diagnose") {
+        match unsafe { taskbar::diagnose_layout() } {
+            Some(layout) => println!("{layout}"),
+            None => {
+                eprintln!("The native Windows taskbar band is unavailable");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if std::env::args().any(|argument| argument == "--diagnose") {
         match rpc::fetch_usage() {
             Ok(result) => println!("{result:#?}"),
