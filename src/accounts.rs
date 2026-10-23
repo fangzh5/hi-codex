@@ -9,9 +9,37 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 const MAX_FILE: u64 = 8 * 1024 * 1024;
 const MAX_ACCOUNTS: usize = 100;
+const AUTH_SETTLE_ATTEMPTS: usize = 8;
+static NEXT_LOGIN: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SaveCurrent {
+    Saved,
+    LoginRequired,
+}
+
+struct LoginDirectory {
+    base: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for LoginDirectory {
+    fn drop(&mut self) {
+        // This is the unique directory created exclusively for this login.
+        // Do not traverse a directory replaced by a reparse point.
+        if self.path.parent() == Some(self.base.as_path())
+            && fs::symlink_metadata(&self.path)
+                .is_ok_and(|metadata| metadata.is_dir() && metadata.file_attributes() & 0x400 == 0)
+        {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Account {
@@ -107,6 +135,26 @@ fn read_optional_bounded(path: &Path) -> Result<Option<Vec<u8>>, String> {
 fn json_bytes(bytes: &[u8]) -> Result<Value, String> {
     serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes))
         .map_err(|_| "Invalid account JSON; no credentials were changed".into())
+}
+
+fn settled_auth(
+    mut read: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+    mut wait: impl FnMut(),
+) -> Result<Option<Value>, String> {
+    for attempt in 0..AUTH_SETTLE_ATTEMPTS {
+        if let Some(bytes) = read()? {
+            let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+            match serde_json::from_slice(bytes) {
+                Ok(auth) => return Ok(Some(auth)),
+                Err(error) if error.is_eof() && attempt + 1 < AUTH_SETTLE_ATTEMPTS => {}
+                Err(_) => return Err("Invalid account JSON; no credentials were changed".into()),
+            }
+        } else if attempt + 1 == AUTH_SETTLE_ATTEMPTS {
+            return Ok(None);
+        }
+        wait();
+    }
+    unreachable!("the last attempt always returns")
 }
 
 fn text(value: &Value, field: &str) -> Option<String> {
@@ -338,7 +386,7 @@ impl AccountManager {
                 .get("forced_chatgpt_workspace_id")
                 .and_then(toml::Value::as_str)
             {
-                if auth["tokens"]["account_id"].as_str() != Some(forced) {
+                if !auth.is_null() && auth["tokens"]["account_id"].as_str() != Some(forced) {
                     return Err(
                         "The target account does not match the required Codex workspace".into(),
                     );
@@ -372,12 +420,68 @@ impl AccountManager {
         })
     }
 
-    pub fn save_current(&self) -> Result<(), String> {
+    pub fn save_current(&self) -> Result<SaveCurrent, String> {
         let _lock = self.operation_lock()?;
-        let auth = json_bytes(&read_bounded(&self.auth_path())?)?;
+        // Check unsupported storage/overrides before interpreting a missing
+        // file as a desktop login that needs a separate authorization.
+        self.check_switch_config(&Value::Null)?;
+        let Some(auth) = settled_auth(
+            || read_optional_bounded(&self.auth_path()),
+            || std::thread::sleep(Duration::from_millis(150)),
+        )?
+        else {
+            return Ok(SaveCurrent::LoginRequired);
+        };
         self.check_switch_config(&auth)?;
         let mut store = self.load()?;
-        upsert(&mut store, entry(auth, "")?, true)?;
+        upsert(&mut store, entry(auth.clone(), "")?, true)?;
+        if read_optional_bounded(&self.auth_path())?
+            .as_deref()
+            .and_then(|bytes| json_bytes(bytes).ok())
+            .as_ref()
+            != Some(&auth)
+        {
+            return Err("The login changed while saving. Wait for Codex sign-in to finish, then save again; saved accounts were not changed.".into());
+        }
+        self.save(&store)?;
+        Ok(SaveCurrent::Saved)
+    }
+
+    pub fn sign_in_and_save(
+        &self,
+        cancel: &AtomicBool,
+        login: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let check_cancel = || {
+            if cancel.load(Ordering::Acquire) {
+                Err("Account sign-in cancelled; saved accounts were not changed".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        check_cancel()?;
+        self.check_switch_config(&Value::Null)?;
+        // Do not hold the library lock while the user signs in in a browser.
+        // The isolated home keeps the desktop login and its files untouched.
+        drop(self.operation_lock()?);
+        let base = fs::canonicalize(self.directory())
+            .map_err(|_| "Could not locate account storage directory")?;
+        let path = base.join(format!(
+            "login-{}-{}",
+            std::process::id(),
+            NEXT_LOGIN.fetch_add(1, Ordering::Relaxed)
+        ));
+        credential_storage::create_private_directory(&path)?;
+        let staging = LoginDirectory { base, path };
+        login(&staging.path)?;
+        check_cancel()?;
+        let auth = json_bytes(&read_bounded(&staging.path.join("auth.json"))?)?;
+        self.check_switch_config(&auth)?;
+        let incoming = entry(auth, "")?;
+        let _lock = self.operation_lock()?;
+        let mut store = self.load()?;
+        upsert(&mut store, incoming, true)?;
+        check_cancel()?;
         self.save(&store)
     }
 
@@ -484,17 +588,22 @@ impl AccountManager {
             .ok_or("Account no longer exists")?["auth"]
             .clone();
         self.check_switch_config(&target)?;
-        let original = read_bounded(&self.auth_path())?;
-        let current = json_bytes(&original)?;
-        let current_key = identity(&current)?.key;
-        if current_key == key {
-            return Ok(false);
+        let original = read_optional_bounded(&self.auth_path())?;
+        if let Some(original) = original.as_deref() {
+            let current = json_bytes(original)?;
+            if identity(&current)?.key == key {
+                return Ok(false);
+            }
+            // Capture refresh-token rotation BEFORE leaving the current account.
+            upsert(&mut store, entry(current.clone(), "")?, true)?;
+            store["backup"] = json!({"auth": current, "target": target});
+        } else {
+            // Logout removes auth.json. Selecting a saved account must still
+            // work, and must not advertise an unrelated older restore backup.
+            store["backup"] = Value::Null;
         }
-        // Capture refresh-token rotation BEFORE leaving the current account.
-        upsert(&mut store, entry(current.clone(), "")?, true)?;
-        store["backup"] = json!({"auth": current, "target": target});
         self.save(&store)?;
-        self.activate_if_unchanged(Some(&original), &target)?;
+        self.activate_if_unchanged(original.as_deref(), &target)?;
         Ok(true)
     }
 
@@ -603,6 +712,201 @@ mod tests {
         assert!(a.label(true, 0).contains("Private && work [personal]"));
         assert!(b.label(true, 1).contains("[team]"));
         assert!(!format!("{a:?}").contains("fixture@example.com"));
+    }
+
+    #[test]
+    fn desktop_logout_then_browser_save_preserves_both_accounts() {
+        let f = Fixture::new();
+        let a = auth("user1", "personal", "one");
+        let b = auth("user2", "personal", "two");
+        f.active(&a);
+        assert_eq!(f.manager.save_current().unwrap(), SaveCurrent::Saved);
+        let saved = fs::read(f.manager.storage_path()).unwrap();
+        fs::remove_file(f.manager.auth_path()).unwrap();
+
+        assert_eq!(
+            f.manager.save_current().unwrap(),
+            SaveCurrent::LoginRequired
+        );
+        assert_eq!(fs::read(f.manager.storage_path()).unwrap(), saved);
+        assert!(f.manager.list().unwrap().active_key.is_none());
+
+        let mut staging_path = PathBuf::new();
+        f.manager
+            .sign_in_and_save(&AtomicBool::new(false), |home| {
+                staging_path = home.to_owned();
+                assert_ne!(home, f.manager.home);
+                // A browser login must not hold the account library's write lock.
+                let lock = f.manager.operation_lock()?;
+                drop(lock);
+                fs::write(home.join("auth.json"), serde_json::to_vec(&b).unwrap()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(!staging_path.exists());
+        assert!(!f.manager.auth_path().exists());
+        let store = f.manager.load().unwrap();
+        assert_eq!(store["accounts"].as_array().unwrap().len(), 2);
+        assert_eq!(store["accounts"][0]["auth"], a);
+        assert_eq!(store["accounts"][1]["auth"], b);
+
+        // Selecting user2 also works after the desktop logout deleted auth.json.
+        assert!(f.manager.switch("user2::personal").unwrap());
+        assert_eq!(
+            json_bytes(&fs::read(f.manager.auth_path()).unwrap()).unwrap(),
+            b
+        );
+        assert!(!f.manager.list().unwrap().can_restore);
+    }
+
+    #[test]
+    fn browser_save_keeps_newer_desktop_login_and_library_changes() {
+        let f = Fixture::new();
+        let a = auth("a", "workspace", "a");
+        let b = auth("b", "workspace", "b");
+        let c = auth("c", "workspace", "c");
+        f.active(&a);
+        f.manager.save_current().unwrap();
+        f.manager
+            .sign_in_and_save(&AtomicBool::new(false), |home| {
+                // Another writer can update the library during browser authorization.
+                f.manager.import_entries(vec![entry(c.clone(), "Work")?])?;
+                f.active(&c);
+                fs::write(home.join("auth.json"), serde_json::to_vec(&b).unwrap()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(f.manager.list().unwrap().accounts.len(), 3);
+        assert_eq!(
+            json_bytes(&fs::read(f.manager.auth_path()).unwrap()).unwrap(),
+            c
+        );
+        assert_eq!(f.manager.load().unwrap()["accounts"][1]["alias"], "Work");
+    }
+
+    #[test]
+    fn failed_or_invalid_browser_login_does_not_modify_saved_or_active_accounts() {
+        let f = Fixture::new();
+        f.active(&auth("a", "workspace", "a"));
+        f.manager.save_current().unwrap();
+        let saved = fs::read(f.manager.storage_path()).unwrap();
+        let active = fs::read(f.manager.auth_path()).unwrap();
+        for credentials in [None, Some(b"{}".as_slice()), Some(b"invalid")] {
+            let mut staging_path = PathBuf::new();
+            let result = f.manager.sign_in_and_save(&AtomicBool::new(false), |home| {
+                staging_path = home.to_owned();
+                if let Some(bytes) = credentials {
+                    fs::write(home.join("auth.json"), bytes).unwrap();
+                    Ok(())
+                } else {
+                    Err("cancelled".into())
+                }
+            });
+            assert!(result.is_err());
+            assert!(!staging_path.exists());
+            assert_eq!(fs::read(f.manager.storage_path()).unwrap(), saved);
+            assert_eq!(fs::read(f.manager.auth_path()).unwrap(), active);
+        }
+    }
+
+    #[test]
+    fn saving_waits_for_new_login_without_reading_old_snapshots() {
+        let b = auth("user2", "workspace", "new");
+        let mut reads = [
+            None,
+            Some(b"{\"tokens\":".to_vec()),
+            Some(serde_json::to_vec(&b).unwrap()),
+        ]
+        .into_iter();
+        let mut waits = 0;
+        let result = settled_auth(|| Ok(reads.next().unwrap()), || waits += 1).unwrap();
+        assert_eq!(result, Some(b));
+        assert_eq!(waits, 2);
+
+        let mut waits = 0;
+        assert!(settled_auth(|| Ok(None), || waits += 1).unwrap().is_none());
+        assert_eq!(waits, AUTH_SETTLE_ATTEMPTS - 1);
+        assert!(settled_auth(
+            || Err("inaccessible".into()),
+            || panic!("IO errors are not missing files")
+        )
+        .is_err());
+        assert!(settled_auth(
+            || Ok(Some(b"invalid".to_vec())),
+            || panic!("invalid JSON is not a login transition")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cancellation_after_browser_completion_keeps_library_and_desktop_login() {
+        let f = Fixture::new();
+        f.active(&auth("user1", "workspace", "one"));
+        f.manager.save_current().unwrap();
+        let saved = fs::read(f.manager.storage_path()).unwrap();
+        let active = fs::read(f.manager.auth_path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut staging_path = PathBuf::new();
+        let result = f.manager.sign_in_and_save(&cancel, |home| {
+            staging_path = home.to_owned();
+            fs::write(
+                home.join("auth.json"),
+                serde_json::to_vec(&auth("user2", "workspace", "two")).unwrap(),
+            )
+            .unwrap();
+            cancel.store(true, Ordering::Release);
+            Ok(())
+        });
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert_eq!(fs::read(f.manager.storage_path()).unwrap(), saved);
+        assert_eq!(fs::read(f.manager.auth_path()).unwrap(), active);
+        assert!(!staging_path.exists());
+        assert!(f
+            .manager
+            .sign_in_and_save(&cancel, |_| panic!("a cancelled sign-in must not start"))
+            .is_err());
+    }
+
+    #[test]
+    fn browser_login_checks_required_workspace_before_saving() {
+        let f = Fixture::new();
+        fs::write(
+            f.manager.home.join("config.toml"),
+            "forced_chatgpt_workspace_id = 'required'",
+        )
+        .unwrap();
+        let result = f.manager.sign_in_and_save(&AtomicBool::new(false), |home| {
+            fs::write(
+                home.join("auth.json"),
+                serde_json::to_vec(&auth("b", "other", "b")).unwrap(),
+            )
+            .unwrap();
+            Ok(())
+        });
+        assert!(result.unwrap_err().contains("required Codex workspace"));
+        assert!(!f.manager.storage_path().exists());
+        assert!(!f.manager.auth_path().exists());
+    }
+
+    #[test]
+    fn logged_out_switch_does_not_reuse_an_older_restore_backup() {
+        let f = Fixture::new();
+        let a = auth("a", "workspace", "a");
+        let b = auth("b", "workspace", "b");
+        f.active(&a);
+        f.manager.save_current().unwrap();
+        f.manager
+            .import_entries(vec![entry(b, "").unwrap()])
+            .unwrap();
+        f.manager.switch("b::workspace").unwrap();
+        assert!(f.manager.list().unwrap().can_restore);
+        fs::remove_file(f.manager.auth_path()).unwrap();
+        f.manager.switch("a::workspace").unwrap();
+        assert!(!f.manager.list().unwrap().can_restore);
+        assert_eq!(
+            json_bytes(&fs::read(f.manager.auth_path()).unwrap()).unwrap(),
+            a
+        );
     }
 
     #[test]

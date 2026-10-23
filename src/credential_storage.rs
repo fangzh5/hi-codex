@@ -18,8 +18,8 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, MoveFileExW, ReplaceFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE,
-    MOVEFILE_WRITE_THROUGH, OPEN_ALWAYS,
+    CreateDirectoryW, CreateFileW, MoveFileExW, ReplaceFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+    FILE_GENERIC_WRITE, MOVEFILE_WRITE_THROUGH, OPEN_ALWAYS,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -73,6 +73,37 @@ fn private_file(path: &Path, disposition: u32) -> Result<File, String> {
 
 pub fn lock(path: &Path) -> Result<File, String> {
     private_file(path, OPEN_ALWAYS)
+}
+
+pub fn create_private_directory(path: &Path) -> Result<(), String> {
+    // Credentials written by Codex inherit a private ACL from this fresh home.
+    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut descriptor = null_mut();
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        ) == 0
+        {
+            return Err("Could not prepare private sign-in directory permissions".into());
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let created = CreateDirectoryW(wide_path(path).as_ptr(), &attributes);
+        LocalFree(descriptor);
+        if created == 0 {
+            return Err("Could not create a private sign-in directory".into());
+        }
+    }
+    Ok(())
 }
 
 pub fn protect(bytes: &[u8]) -> Result<Vec<u8>, String> {

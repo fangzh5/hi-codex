@@ -3,8 +3,8 @@ use serde_json::{json, Value};
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -66,6 +66,16 @@ fn wait_for_response_cancellable(
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Result<Value, String> {
+    wait_for_response_buffered(receiver, request_id, timeout, cancel, &mut Vec::new())
+}
+
+fn wait_for_response_buffered(
+    receiver: &Receiver<Value>,
+    request_id: i64,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+    login_notifications: &mut Vec<Value>,
+) -> Result<Value, String> {
     let deadline = Instant::now() + timeout;
     loop {
         if cancelled(cancel) {
@@ -95,7 +105,13 @@ fn wait_for_response_cancellable(
                 }
                 return Ok(value);
             }
-            Ok(_) => continue,
+            Ok(value) => {
+                // A fast browser callback can complete before the login/start
+                // response. Retain that notification for the sign-in waiter.
+                if value["method"] == "account/login/completed" && login_notifications.len() < 16 {
+                    login_notifications.push(value);
+                }
+            }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
                 return Err("Codex App Server closed unexpectedly".to_owned())
@@ -156,10 +172,16 @@ fn codex_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-fn start_app_server() -> Result<Child, String> {
+fn start_app_server(home: Option<&Path>) -> Result<Child, String> {
     let mut last_error = None;
     for candidate in codex_candidates() {
-        match Command::new(&candidate)
+        let mut command = Command::new(&candidate);
+        if let Some(home) = home {
+            command
+                .env("CODEX_HOME", home)
+                .args(["-c", "cli_auth_credentials_store=\"file\""]);
+        }
+        match command
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -179,81 +201,193 @@ fn start_app_server() -> Result<Child, String> {
             .unwrap_or_else(|| "no executable candidate was found".to_owned())
     ))
 }
+
+struct AppServerSession {
+    child: Child,
+    stdin: ChildStdin,
+    receiver: Receiver<Value>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AppServerSession {
+    fn start(home: Option<&Path>) -> Result<Self, String> {
+        let mut child = start_app_server(home)?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Codex App Server stdin was unavailable".into());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Codex App Server stdout was unavailable".into());
+        };
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    if sender.send(value).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            receiver,
+            reader: Some(reader),
+        })
+    }
+}
+
+impl Drop for AppServerSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn initialize(session: &mut AppServerSession, cancel: Option<&AtomicBool>) -> Result<(), String> {
+    send(
+        &mut session.stdin,
+        &json!({
+            "method": "initialize", "id": 1,
+            "params": { "clientInfo": {
+                "name": "hi-codex", "title": "HiCodex", "version": env!("CARGO_PKG_VERSION")
+            }}
+        }),
+    )?;
+    wait_for_response_cancellable(&session.receiver, 1, REQUEST_TIMEOUT, cancel)?;
+    send(
+        &mut session.stdin,
+        &json!({"method": "initialized", "params": {}}),
+    )
+}
+
+fn login_start(response: &Value) -> Result<(&str, &str), String> {
+    let result = &response["result"];
+    let id = result["loginId"].as_str().filter(|id| !id.is_empty());
+    let url = result["authUrl"].as_str().filter(|url| {
+        url.len() <= 16_384
+            && !url.chars().any(char::is_control)
+            && ["https://auth.openai.com/", "https://chatgpt.com/"]
+                .iter()
+                .any(|prefix| url.starts_with(prefix))
+    });
+    match (result["type"].as_str(), id, url) {
+        (Some("chatgpt"), Some(id), Some(url)) => Ok((id, url)),
+        _ => Err("Codex did not return a supported browser sign-in link".into()),
+    }
+}
+
+fn wait_for_login(
+    receiver: &Receiver<Value>,
+    login_id: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("Account sign-in cancelled; saved accounts were not changed".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "Account sign-in timed out. Choose Sign in and save account to retry.".into(),
+            );
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            Ok(value) => {
+                if let Some(result) = login_completion(&value, login_id) {
+                    return result;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("Codex closed before sign-in completed".into())
+            }
+        }
+    }
+}
+
+fn login_completion(value: &Value, login_id: &str) -> Option<Result<(), String>> {
+    if value["method"] != "account/login/completed"
+        || value["params"]["loginId"].as_str() != Some(login_id)
+    {
+        return None;
+    }
+    Some(if value["params"]["success"] == true {
+        Ok(())
+    } else {
+        Err("Codex sign-in did not complete; saved accounts were not changed".into())
+    })
+}
+
+pub fn sign_in(
+    home: &Path,
+    open_browser: impl FnOnce(&str) -> Result<(), String>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut session = AppServerSession::start(Some(home))?;
+    initialize(&mut session, Some(cancel))?;
+    send(
+        &mut session.stdin,
+        &json!({
+            "method": "account/login/start", "id": 2, "params": {"type": "chatgpt"}
+        }),
+    )?;
+    let mut notifications = Vec::new();
+    let response = wait_for_response_buffered(
+        &session.receiver,
+        2,
+        REQUEST_TIMEOUT,
+        Some(cancel),
+        &mut notifications,
+    )?;
+    let (id, url) = login_start(&response)?;
+    open_browser(url)?;
+    if let Some(result) = notifications
+        .iter()
+        .find_map(|value| login_completion(value, id))
+    {
+        return result;
+    }
+    wait_for_login(&session.receiver, id, Duration::from_secs(180), cancel)
+}
+
 fn fetch_usage_once(cancel: Option<&AtomicBool>) -> Result<UsageResult, String> {
     if cancelled(cancel) {
         return Err("Usage refresh cancelled for account management".into());
     }
-    let mut child = start_app_server()?;
+    let mut session = AppServerSession::start(None)?;
+    initialize(&mut session, cancel)?;
+    send(
+        &mut session.stdin,
+        &json!({
+            "method": "account/read",
+            "id": 2,
+            "params": { "refreshToken": false }
+        }),
+    )?;
+    let account_response =
+        wait_for_response_cancellable(&session.receiver, 2, REQUEST_TIMEOUT, cancel)?;
+    send(
+        &mut session.stdin,
+        &json!({"method": "account/rateLimits/read", "id": 3}),
+    )?;
+    let limits_response =
+        wait_for_response_cancellable(&session.receiver, 3, REQUEST_TIMEOUT, cancel)?;
+    let usage = parse_rate_limit_response(&limits_response)?;
 
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex App Server stdin was unavailable".to_owned());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex App Server stdout was unavailable".to_owned());
-    };
-
-    let (sender, receiver) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                if sender.send(value).is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    let result = (|| {
-        send(
-            &mut stdin,
-            &json!({
-                "method": "initialize",
-                "id": 1,
-                "params": {
-                    "clientInfo": {
-                        "name": "hi-codex",
-                        "title": "HiCodex",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }
-            }),
-        )?;
-        wait_for_response_cancellable(&receiver, 1, REQUEST_TIMEOUT, cancel)?;
-
-        send(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
-        send(
-            &mut stdin,
-            &json!({
-                "method": "account/read",
-                "id": 2,
-                "params": { "refreshToken": false }
-            }),
-        )?;
-        let account_response =
-            wait_for_response_cancellable(&receiver, 2, REQUEST_TIMEOUT, cancel)?;
-        send(
-            &mut stdin,
-            &json!({"method": "account/rateLimits/read", "id": 3}),
-        )?;
-        let limits_response = wait_for_response_cancellable(&receiver, 3, REQUEST_TIMEOUT, cancel)?;
-        let usage = parse_rate_limit_response(&limits_response)?;
-
-        Ok(UsageResult {
-            usage,
-            account: parse_account(&account_response),
-        })
-    })();
-
-    drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = reader.join();
-    result
+    Ok(UsageResult {
+        usage,
+        account: parse_account(&account_response),
+    })
 }
 
 pub fn fetch_usage() -> Result<UsageResult, String> {
@@ -300,6 +434,83 @@ fn fetch_usage_impl(cancel: Option<&AtomicBool>) -> Result<UsageResult, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_login_accepts_only_supported_https_links() {
+        let response = |url: &str| {
+            json!({"result": {
+                "type": "chatgpt", "loginId": "expected", "authUrl": url
+            }})
+        };
+        assert!(login_start(&response(
+            "https://auth.openai.com/oauth/authorize?state=synthetic"
+        ))
+        .is_ok());
+        assert!(login_start(&response("https://chatgpt.com/auth/login")).is_ok());
+        for url in [
+            "file:///test",
+            "javascript:test",
+            "https://auth.openai.com.evil.invalid/login",
+            "https://other.invalid/",
+            "https://chatgpt.com/\n",
+        ] {
+            assert!(login_start(&response(url)).is_err());
+        }
+        assert!(login_start(
+            &json!({"result": {"type": "chatgpt", "authUrl": "https://auth.openai.com/"}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn browser_login_requires_matching_success_and_can_be_cancelled() {
+        let cancel = AtomicBool::new(false);
+        for success in [json!(true), json!(false), Value::Null, json!("true")] {
+            let (sender, receiver) = mpsc::channel();
+            sender.send(json!({"method": "account/login/completed", "params": {"loginId": "other", "success": true}})).unwrap();
+            sender
+                .send(json!({"method": "account/updated", "params": {"authMode": "chatgpt"}}))
+                .unwrap();
+            sender.send(json!({"method": "account/login/completed", "params": {"loginId": "expected", "success": success}})).unwrap();
+            let result = wait_for_login(&receiver, "expected", Duration::from_millis(100), &cancel);
+            assert_eq!(result.is_ok(), success == true);
+        }
+        let (_sender, receiver) = mpsc::channel();
+        assert!(
+            wait_for_login(&receiver, "expected", Duration::ZERO, &cancel)
+                .unwrap_err()
+                .contains("timed out")
+        );
+        cancel.store(true, Ordering::Release);
+        assert!(
+            wait_for_login(&receiver, "expected", Duration::from_secs(10), &cancel)
+                .unwrap_err()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn browser_login_does_not_lose_completion_before_start_response() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(json!({"method": "account/login/completed", "params": {"loginId": "expected", "success": true}})).unwrap();
+        sender
+            .send(json!({"id": 2, "result": {"type": "chatgpt"}}))
+            .unwrap();
+        let mut notifications = Vec::new();
+        wait_for_response_buffered(
+            &receiver,
+            2,
+            Duration::from_millis(100),
+            None,
+            &mut notifications,
+        )
+        .unwrap();
+        assert!(notifications
+            .iter()
+            .find_map(|value| login_completion(value, "expected"))
+            .unwrap()
+            .is_ok());
+    }
 
     #[test]
     fn pending_refresh_can_be_cancelled_for_switching() {

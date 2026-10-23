@@ -1,3 +1,4 @@
+use crate::rebar::{self, Band};
 use std::ffi::c_void;
 use std::mem::{size_of, transmute, zeroed};
 use std::os::windows::process::CommandExt;
@@ -6,16 +7,19 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
-use windows_sys::Win32::UI::Accessibility::AccessibleObjectFromWindow;
+use windows_sys::Win32::UI::Accessibility::{
+    AccessibleObjectFromWindow, SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetClientRect, GetWindowRect, GetWindowThreadProcessId,
-    SetWindowPos, OBJID_CLIENT, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
+    FindWindowExW, FindWindowW, GetParent, GetWindowRect, GetWindowThreadProcessId, IsChild,
+    PostMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_REORDER, OBJID_CLIENT, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS,
 };
 
 const SETTINGS_KEY: &str = r"HKCU\Software\HiCodex";
@@ -30,36 +34,63 @@ const TASKBAR_ACRYLIC_TINT: u32 = 0x9028_2220;
 
 static COM_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_TASKBAR_POLICIES: OnceLock<Mutex<Vec<AccentPlacement>>> = OnceLock::new();
-static TASK_LIST_PLACEMENT: Mutex<Option<TaskListPlacement>> = Mutex::new(None);
+static BAND_PLACEMENT: Mutex<Option<BandPlacement>> = Mutex::new(None);
+static BUTTON_SPAN: Mutex<Option<ButtonSpan>> = Mutex::new(None);
+static LAYOUT_WATCH: Mutex<Option<LayoutWatch>> = Mutex::new(None);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TaskListPlacement {
-    parent: HWND,
-    window: HWND,
-    original: (i32, i32),
-    applied: (i32, i32),
+struct LayoutWatch {
+    taskbar: HWND,
+    process: u32,
+    receiver: HWND,
+    message: u32,
+    hooks: [HWINEVENTHOOK; 2],
+    queued: bool,
 }
 
-impl TaskListPlacement {
-    fn owns_position(&self, parent: HWND, window: HWND, current: (i32, i32)) -> bool {
-        self.parent == parent && self.window == window && self.applied == current
+#[derive(Clone, Copy)]
+struct ButtonSpan {
+    parent: HWND,
+    window: HWND,
+    process: u32,
+    width: i32,
+    leading: i32,
+}
+
+impl ButtonSpan {
+    fn for_window(self, parent: HWND, window: HWND, process: u32) -> Option<Self> {
+        (self.parent == parent && self.window == window && self.process == process).then_some(self)
+    }
+}
+
+fn remember_button_span(
+    cached: &mut Option<ButtonSpan>,
+    parent: HWND,
+    window: HWND,
+    process: u32,
+    measured: Option<ButtonSpan>,
+) -> Option<ButtonSpan> {
+    *cached = measured.or_else(|| cached.and_then(|span| span.for_window(parent, window, process)));
+    *cached
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BandPlacement {
+    band: Band,
+    original: u32,
+    applied: u32,
+}
+
+impl BandPlacement {
+    fn owns(&self, band: Band) -> bool {
+        self.band.same_owner(band) && self.applied == band.header
     }
 
-    fn after_move(
-        previous: Option<Self>,
-        parent: HWND,
-        window: HWND,
-        current: (i32, i32),
-        applied: (i32, i32),
-    ) -> Self {
-        // If Explorer or another tool moved the list, preserve that newer
-        // position as the baseline for our next move.
+    fn after_change(previous: Option<Self>, band: Band, applied: u32) -> Self {
         let original = previous
-            .filter(|saved| saved.owns_position(parent, window, current))
-            .map_or(current, |saved| saved.original);
+            .filter(|saved| saved.owns(band))
+            .map_or(band.header, |saved| saved.original);
         Self {
-            parent,
-            window,
+            band,
             original,
             applied,
         }
@@ -132,14 +163,26 @@ fn centered_group_left(
     ) as i32)
 }
 
-fn recovery_offset(saved: i32, extent: i32) -> i32 {
-    // Do not clamp an obsolete RDP offset to the last visible pixel: that
-    // would leave nearly the entire icon list outside its parent.
-    if saved >= 0 && saved < extent {
-        saved
-    } else {
-        0
-    }
+fn centered_band_header(
+    taskbar: (i32, i32),
+    band: (i32, i32),
+    reserved_right: i32,
+    original: u32,
+    min_child: u32,
+    span: ButtonSpan,
+) -> Option<u32> {
+    let original = i32::try_from(original).ok()?;
+    let min_child = i32::try_from(min_child).ok()?;
+    let left = band.0.checked_add(original)?.checked_add(span.leading)?;
+    // Keep both the buttons and the native child's minimum width reachable.
+    let right = reserved_right.min(band.1).min(
+        band.1
+            .checked_sub(min_child)?
+            .checked_add(span.leading)?
+            .checked_add(span.width)?,
+    );
+    let target = centered_group_left(taskbar.0, taskbar.1, left, right, span.width)?;
+    u32::try_from(target.checked_sub(span.leading)?.checked_sub(band.0)?).ok()
 }
 
 #[repr(C)]
@@ -230,8 +273,124 @@ pub unsafe fn initialize() {
 }
 
 pub unsafe fn shutdown() {
+    stop_layout_watch();
+    rebar::release();
     if COM_INITIALIZED.swap(false, Ordering::AcqRel) {
         CoUninitialize();
+    }
+}
+
+unsafe extern "system" fn taskbar_layout_changed(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    object: i32,
+    child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    // MSAA can reenter during measurement. Never measure or move Explorer from
+    // this callback; coalesce its burst of events into one UI-thread message.
+    let Ok(mut watch) = LAYOUT_WATCH.try_lock() else {
+        return;
+    };
+    let Some(watch) = watch.as_mut() else {
+        return;
+    };
+    let mut destroyed_list = false;
+    if event == EVENT_OBJECT_DESTROY && object == OBJID_WINDOW && child == 0 {
+        if let Ok(mut cached) = BUTTON_SPAN.try_lock() {
+            if cached.is_some_and(|span| {
+                span.window == hwnd || span.parent == hwnd || watch.taskbar == hwnd
+            }) {
+                *cached = None;
+                destroyed_list = true;
+            }
+        }
+    }
+    if !watch.queued
+        && hwnd != 0
+        && (destroyed_list || hwnd == watch.taskbar || IsChild(watch.taskbar, hwnd) != 0)
+    {
+        watch.queued = PostMessageW(watch.receiver, watch.message, 0, 0) != 0;
+    }
+}
+
+pub unsafe fn watch_layout(receiver: HWND, message: u32) {
+    let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+    let process = window_process(taskbar);
+    let Ok(mut saved) = LAYOUT_WATCH.lock() else {
+        return;
+    };
+    if saved.as_ref().is_some_and(|watch| {
+        watch.taskbar == taskbar && watch.process == process && watch.receiver == receiver
+    }) {
+        return;
+    }
+    if let Some(watch) = saved.take() {
+        for hook in watch.hooks {
+            UnhookWinEvent(hook);
+        }
+    }
+    if taskbar == 0 || process == 0 {
+        return;
+    }
+    let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    let hooks = [
+        SetWinEventHook(
+            EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_REORDER,
+            0,
+            Some(taskbar_layout_changed),
+            process,
+            0,
+            flags,
+        ),
+        SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            0,
+            Some(taskbar_layout_changed),
+            process,
+            0,
+            flags,
+        ),
+    ];
+    if hooks.contains(&0) {
+        for hook in hooks.into_iter().filter(|hook| *hook != 0) {
+            UnhookWinEvent(hook);
+        }
+        // The existing slow timer still works and will retry registration.
+        return;
+    }
+    *saved = Some(LayoutWatch {
+        taskbar,
+        process,
+        receiver,
+        message,
+        hooks,
+        queued: false,
+    });
+}
+
+pub fn acknowledge_layout_change() {
+    if let Ok(mut watch) = LAYOUT_WATCH.lock() {
+        if let Some(watch) = watch.as_mut() {
+            watch.queued = false;
+        }
+    }
+}
+
+pub unsafe fn stop_layout_watch() {
+    if let Ok(mut saved) = LAYOUT_WATCH.lock() {
+        if let Some(watch) = saved.take() {
+            for hook in watch.hooks {
+                UnhookWinEvent(hook);
+            }
+        }
+    }
+    if let Ok(mut span) = BUTTON_SPAN.lock() {
+        *span = None;
     }
 }
 
@@ -478,7 +637,9 @@ pub unsafe fn apply_centered() -> bool {
     let Some((taskbar, task_switch, task_list)) = find_task_list() else {
         return false;
     };
-
+    let Some(band) = rebar::task_band(GetParent(task_switch), task_switch) else {
+        return false;
+    };
     let mut taskbar_rect: RECT = zeroed();
     let mut switch_rect: RECT = zeroed();
     let mut list_rect: RECT = zeroed();
@@ -490,169 +651,288 @@ pub unsafe fn apply_centered() -> bool {
         return false;
     }
 
-    let Some((first_button, last_button)) = task_button_bounds(task_list, taskbar_rect) else {
-        restore_left();
-        return false;
-    };
-    let group_width = last_button - first_button;
-    let leading_margin = first_button - list_rect.left;
-
-    let mut client: RECT = zeroed();
-    let mut origin = POINT { x: 0, y: 0 };
-    if GetClientRect(task_switch, &mut client) == 0 || ClientToScreen(task_switch, &mut origin) == 0
+    let bounds = task_button_bounds(task_list, taskbar_rect);
+    let mut latest_list: RECT = zeroed();
+    let mut latest_switch: RECT = zeroed();
+    if GetWindowRect(task_list, &mut latest_list) == 0
+        || GetWindowRect(task_switch, &mut latest_switch) == 0
     {
         return false;
     }
-    let available_left = origin.x.max(taskbar_rect.left);
-    let mut available_right = origin
-        .x
-        .saturating_add(client.right)
-        .min(taskbar_rect.right);
-    reduce_right_boundary(
-        taskbar,
-        "TrayNotifyWnd",
-        available_left,
-        &mut available_right,
-    );
-    reduce_right_boundary(
-        taskbar,
-        "HiCodex.TaskbarWidget",
-        available_left,
-        &mut available_right,
-    );
-    reduce_right_boundary(
-        taskbar,
-        "DynamicContent2",
-        available_left,
-        &mut available_right,
-    );
+    let stable = latest_list.left == list_rect.left
+        && latest_list.right == list_rect.right
+        && latest_list.top == list_rect.top
+        && latest_list.bottom == list_rect.bottom
+        && latest_switch.left == switch_rect.left
+        && latest_switch.right == switch_rect.right;
+    switch_rect = latest_switch;
+    let measured = bounds
+        .filter(|(first, _)| stable && *first >= switch_rect.left)
+        .map(|(first, last)| ButtonSpan {
+            parent: task_switch,
+            window: task_list,
+            process: band.process,
+            width: last - first,
+            leading: first - switch_rect.left,
+        });
+    let span = if let Ok(mut cached) = BUTTON_SPAN.lock() {
+        remember_button_span(&mut cached, task_switch, task_list, band.process, measured)
+    } else {
+        measured
+    };
+    let Some(span) = span else {
+        return false;
+    };
 
-    let Some(target_group_left) = centered_group_left(
-        taskbar_rect.left,
-        taskbar_rect.right,
-        available_left,
+    let Ok(mut saved) = BAND_PLACEMENT.try_lock() else {
+        return false;
+    };
+    let original = saved
+        .filter(|saved| saved.owns(band))
+        .map_or(band.header, |saved| saved.original);
+    let Ok(header) = i32::try_from(band.header) else {
+        return false;
+    };
+    let Some(band_left) = switch_rect.left.checked_sub(header) else {
+        return false;
+    };
+    let mut available_right = switch_rect.right.min(taskbar_rect.right);
+    for class_name in ["TrayNotifyWnd", "HiCodex.TaskbarWidget", "DynamicContent2"] {
+        reduce_right_boundary(taskbar, class_name, band_left, &mut available_right);
+    }
+    let target = centered_band_header(
+        (taskbar_rect.left, taskbar_rect.right),
+        (band_left, switch_rect.right),
         available_right,
-        group_width,
-    ) else {
+        original,
+        band.min_child,
+        span,
+    );
+    let Some(target) = target else {
+        drop(saved);
         return restore_left();
     };
-    let target_list_left = target_group_left - leading_margin;
-    let mut current = POINT {
-        x: list_rect.left,
-        y: list_rect.top,
-    };
-    let mut target = POINT {
-        x: target_list_left,
-        y: list_rect.top,
-    };
-    if ScreenToClient(task_switch, &mut current) == 0
-        || ScreenToClient(task_switch, &mut target) == 0
-    {
-        return false;
-    }
-    let current = (current.x, current.y);
-    // Reject, rather than silently shift, a target that would clip icons.
-    if target.x < 0
-        || target
-            .x
-            .saturating_add(leading_margin)
-            .saturating_add(group_width)
-            > client.right
-    {
-        return restore_left();
-    }
-    let target = (target.x, target.y);
-    if current == target {
+    if target == band.header {
         return true;
     }
-    let Ok(mut saved) = TASK_LIST_PLACEMENT.lock() else {
-        return false;
-    };
-    if SetWindowPos(
-        task_list,
-        0,
-        target.0,
-        target.1,
-        0,
-        0,
-        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING,
-    ) == 0
-    {
-        return false;
+    let previous = *saved;
+    // Record ownership before sending: a timed-out control may still apply it.
+    *saved = Some(BandPlacement::after_change(previous, band, target));
+    if rebar::set_header(band, target) {
+        return true;
     }
-    *saved = Some(TaskListPlacement::after_move(
-        *saved,
-        task_switch,
-        task_list,
-        current,
-        target,
-    ));
-    true
+    if rebar::task_band(band.window, band.child)
+        .is_some_and(|current| current.same_owner(band) && current.header == band.header)
+    {
+        *saved = previous;
+    }
+    false
 }
 
 pub unsafe fn restore_left() -> bool {
-    let Ok(mut saved) = TASK_LIST_PLACEMENT.lock() else {
+    let Ok(mut saved) = BAND_PLACEMENT.try_lock() else {
         return false;
     };
     let Some(placement) = *saved else {
+        rebar::release();
         return true;
     };
-    let Some((_, task_switch, task_list)) = find_task_list() else {
-        *saved = None;
-        return true;
-    };
-    let mut rect: RECT = zeroed();
-    if GetWindowRect(task_list, &mut rect) == 0 {
-        return false;
-    }
-    let mut current = POINT {
-        x: rect.left,
-        y: rect.top,
-    };
-    if ScreenToClient(task_switch, &mut current) == 0 {
-        return false;
-    }
-    if !placement.owns_position(task_switch, task_list, (current.x, current.y)) {
-        *saved = None;
-        return true;
-    }
-    let mut parent_rect: RECT = zeroed();
-    if GetClientRect(task_switch, &mut parent_rect) == 0 {
-        return false;
-    }
-    // A saved offset from a larger RDP desktop must not put the list outside
-    // the resized parent. The native task list ordinarily starts at zero.
-    let restore_x = recovery_offset(placement.original.0, parent_rect.right);
-    let restore_y = recovery_offset(placement.original.1, parent_rect.bottom);
-    if SetWindowPos(
-        task_list,
-        0,
-        restore_x,
-        restore_y,
-        0,
-        0,
-        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING,
-    ) == 0
+    if window_process(placement.band.window) != placement.band.process
+        || GetParent(placement.band.child) != placement.band.window
     {
+        *saved = None;
+        rebar::release();
+        return true;
+    }
+    let Some(current) = rebar::task_band(placement.band.window, placement.band.child) else {
+        return false;
+    };
+    if !placement.owns(current) {
+        *saved = None;
+        rebar::release();
+        return true;
+    }
+    if !rebar::set_header(current, placement.original) {
         return false;
     }
     *saved = None;
+    rebar::release();
     true
+}
+
+pub unsafe fn diagnose_layout() -> Option<String> {
+    let (taskbar, child, list) = find_task_list()?;
+    let band = rebar::task_band(GetParent(child), child)?;
+    let mut taskbar_rect: RECT = zeroed();
+    let mut child_rect: RECT = zeroed();
+    let mut list_rect: RECT = zeroed();
+    if GetWindowRect(taskbar, &mut taskbar_rect) == 0
+        || GetWindowRect(child, &mut child_rect) == 0
+        || GetWindowRect(list, &mut list_rect) == 0
+    {
+        return None;
+    }
+    let result = format!(
+        "Native task band: id={}, header={}, min_child={}; taskbar=({}, {}); band=({}, {}); list=({}, {})",
+        band.id, band.header, band.min_child, taskbar_rect.left, taskbar_rect.right,
+        child_rect.left, child_rect.right, list_rect.left, list_rect.right,
+    );
+    rebar::release();
+    Some(result)
+}
+
+pub unsafe fn native_centering_available() -> bool {
+    let Some((taskbar, child, _)) = find_task_list() else {
+        return false;
+    };
+    let mut rect: RECT = zeroed();
+    GetWindowRect(taskbar, &mut rect) != 0
+        && rect.right - rect.left > rect.bottom - rect.top
+        && rebar::task_band(GetParent(child), child).is_some()
 }
 
 #[cfg(test)]
 mod placement_tests {
     use super::{
-        centered_group_left, recovery_offset, AccentPlacement, AccentPolicy, TaskListPlacement,
+        centered_band_header, centered_group_left, remember_button_span, AccentPlacement,
+        AccentPolicy, Band, BandPlacement, ButtonSpan,
     };
 
     #[test]
-    fn obsolete_remote_desktop_restore_offsets_return_to_origin() {
-        assert_eq!(recovery_offset(1400, 640), 0);
-        assert_eq!(recovery_offset(640, 640), 0);
-        assert_eq!(recovery_offset(-10, 640), 0);
-        assert_eq!(recovery_offset(30, 0), 0);
-        assert_eq!(recovery_offset(40, 640), 40);
+    fn temporary_missing_buttons_keep_last_geometry_until_window_is_recreated() {
+        let span = ButtonSpan {
+            parent: 1,
+            window: 2,
+            process: 42,
+            width: 480,
+            leading: 0,
+        };
+        let mut cached = None;
+        remember_button_span(&mut cached, 1, 2, 42, Some(span));
+        // Multiple failed reads during a tray relayout preserve the same target.
+        for _ in 0..8 {
+            let current = remember_button_span(&mut cached, 1, 2, 42, None).unwrap();
+            assert_eq!(
+                centered_group_left(0, 1920, 60, 1500, current.width),
+                Some(720)
+            );
+        }
+        let changed = ButtonSpan { width: 528, ..span };
+        assert_eq!(
+            remember_button_span(&mut cached, 1, 2, 42, Some(changed))
+                .unwrap()
+                .width,
+            528
+        );
+        for (parent, window, process) in [(1, 2, 99), (1, 9, 42), (9, 2, 42)] {
+            let mut cached = Some(span);
+            assert!(remember_button_span(&mut cached, parent, window, process, None).is_none());
+            assert!(cached.is_none());
+        }
+    }
+
+    #[test]
+    fn taskbar_layout_event_bursts_are_coalesced_and_rearmed() {
+        use super::*;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE, WM_APP,
+        };
+        unsafe {
+            // A private message-only test window; never touches the real taskbar.
+            let receiver = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                0,
+                0,
+                null(),
+            );
+            assert_ne!(receiver, 0);
+            let message = WM_APP + 88;
+            *LAYOUT_WATCH.lock().unwrap() = Some(LayoutWatch {
+                taskbar: receiver,
+                process: 42,
+                receiver,
+                message,
+                hooks: [0, 0],
+                queued: false,
+            });
+            for _ in 0..40 {
+                taskbar_layout_changed(0, EVENT_OBJECT_LOCATIONCHANGE, receiver, 0, 0, 0, 0);
+            }
+            let mut received: MSG = zeroed();
+            assert_ne!(
+                PeekMessageW(&mut received, receiver, message, message, PM_REMOVE),
+                0
+            );
+            assert_eq!(
+                PeekMessageW(&mut received, receiver, message, message, PM_REMOVE),
+                0
+            );
+            acknowledge_layout_change();
+            taskbar_layout_changed(0, EVENT_OBJECT_REORDER, receiver, 0, 0, 0, 0);
+            assert_ne!(
+                PeekMessageW(&mut received, receiver, message, message, PM_REMOVE),
+                0
+            );
+            *BUTTON_SPAN.lock().unwrap() = Some(ButtonSpan {
+                parent: receiver,
+                window: receiver,
+                process: 42,
+                width: 480,
+                leading: 0,
+            });
+            // Removing a button must retain the containing window's cache.
+            taskbar_layout_changed(0, EVENT_OBJECT_DESTROY, receiver, OBJID_CLIENT, 1, 0, 0);
+            assert!(BUTTON_SPAN.lock().unwrap().is_some());
+            taskbar_layout_changed(0, EVENT_OBJECT_DESTROY, receiver, OBJID_WINDOW, 0, 0, 0);
+            assert!(BUTTON_SPAN.lock().unwrap().is_none());
+            *LAYOUT_WATCH.lock().unwrap() = None;
+            taskbar_layout_changed(0, EVENT_OBJECT_LOCATIONCHANGE, receiver, 0, 0, 0, 0);
+            assert_eq!(
+                PeekMessageW(&mut received, receiver, message, message, PM_REMOVE),
+                0
+            );
+            DestroyWindow(receiver);
+        }
+    }
+
+    #[test]
+    fn native_header_bounds_preserve_child_minimums_and_handle_display_resizing() {
+        let span = ButtonSpan {
+            parent: 1,
+            window: 2,
+            process: 42,
+            width: 480,
+            leading: 0,
+        };
+        assert_eq!(
+            centered_band_header((0, 1920), (60, 1700), 1500, 0, 48, span),
+            Some(660)
+        );
+        assert_eq!(
+            centered_band_header((-1920, 0), (-1860, -220), -420, 0, 48, span),
+            Some(660)
+        );
+        assert_eq!(
+            centered_band_header((0, 640), (60, 440), 420, 0, 48, span),
+            None
+        );
+        // A native child may need more room than the measured icon buttons.
+        assert_eq!(
+            centered_band_header((0, 1920), (60, 1500), 1500, 0, 1000, span),
+            Some(440)
+        );
+        assert_eq!(
+            centered_band_header((0, 1920), (60, 1500), 1500, 0, u32::MAX, span),
+            None
+        );
     }
 
     #[test]
@@ -730,22 +1010,65 @@ mod placement_tests {
     }
 
     #[test]
-    fn repeated_centering_preserves_original_position() {
-        let first = TaskListPlacement::after_move(None, 1, 2, (40, 3), (300, 3));
-        let next = TaskListPlacement::after_move(Some(first), 1, 2, (300, 3), (350, 3));
-        assert_eq!(next.original, (40, 3));
-        assert!(next.owns_position(1, 2, (350, 3)));
+    fn repeated_centering_preserves_original_band_header() {
+        let band = Band {
+            window: 1,
+            process: 42,
+            child: 2,
+            id: 7,
+            header: 8,
+            min_child: 48,
+        };
+        let first = BandPlacement::after_change(None, band, 400);
+        let current = Band {
+            header: 400,
+            ..band
+        };
+        let next = BandPlacement::after_change(Some(first), current, 440);
+        assert_eq!(next.original, 8);
+        assert!(next.owns(Band {
+            header: 440,
+            ..band
+        }));
     }
 
     #[test]
-    fn external_move_or_recreated_window_is_not_owned() {
-        let saved = TaskListPlacement::after_move(None, 1, 2, (40, 3), (300, 3));
-        assert!(!saved.owns_position(1, 2, (120, 3)));
-        assert!(!saved.owns_position(1, 9, (300, 3)));
-        assert!(!saved.owns_position(9, 2, (300, 3)));
-        let next = TaskListPlacement::after_move(Some(saved), 1, 2, (120, 3), (350, 3));
-        assert_eq!(next.original, (120, 3));
-        let recreated = TaskListPlacement::after_move(Some(saved), 1, 9, (80, 0), (350, 0));
-        assert_eq!(recreated.original, (80, 0));
+    fn external_band_changes_and_recreated_windows_are_not_owned() {
+        let band = Band {
+            window: 1,
+            process: 42,
+            child: 2,
+            id: 7,
+            header: 8,
+            min_child: 48,
+        };
+        let saved = BandPlacement::after_change(None, band, 400);
+        for current in [
+            Band {
+                header: 120,
+                ..band
+            },
+            Band {
+                header: 400,
+                process: 99,
+                ..band
+            },
+            Band {
+                header: 400,
+                child: 9,
+                ..band
+            },
+            Band {
+                header: 400,
+                id: 9,
+                ..band
+            },
+        ] {
+            assert!(!saved.owns(current));
+            assert_eq!(
+                BandPlacement::after_change(Some(saved), current, 440).original,
+                current.header
+            );
+        }
     }
 }
