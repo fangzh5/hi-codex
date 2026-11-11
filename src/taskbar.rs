@@ -3,39 +3,33 @@ use std::ffi::c_void;
 use std::mem::{size_of, transmute, zeroed};
 use std::os::windows::process::CommandExt;
 use std::process::Command;
-use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ptr::null;
 use std::sync::{Mutex, OnceLock};
-use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{HWND, RECT};
-use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-use windows_sys::Win32::System::Variant::{VARIANT, VT_I4};
-use windows_sys::Win32::UI::Accessibility::{
-    AccessibleObjectFromWindow, SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK,
-};
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+#[cfg(test)]
+use windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CLIENT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, FindWindowW, GetParent, GetWindowRect, GetWindowThreadProcessId, IsChild,
     PostMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_REORDER, OBJID_CLIENT, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS,
+    EVENT_OBJECT_REORDER, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 const SETTINGS_KEY: &str = r"HKCU\Software\HiCodex";
 const CENTER_VALUE: &str = "CenterTaskbarIcons";
 const ACRYLIC_VALUE: &str = "AcrylicTaskbar";
-const IID_IACCESSIBLE: GUID = GUID::from_u128(0x618736e0_3c3d_11cf_810c_00aa00389b71);
 const WCA_ACCENT_POLICY: i32 = 19;
 const ACCENT_DISABLED: i32 = 0;
 const ACCENT_ENABLE_BLUR_BEHIND: i32 = 3;
 const ACCENT_ENABLE_ACRYLIC_BLUR_BEHIND: i32 = 4;
 const TASKBAR_ACRYLIC_TINT: u32 = 0x9028_2220;
 
-static COM_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_TASKBAR_POLICIES: OnceLock<Mutex<Vec<AccentPlacement>>> = OnceLock::new();
 static BAND_PLACEMENT: Mutex<Option<BandPlacement>> = Mutex::new(None);
 static BUTTON_SPAN: Mutex<Option<ButtonSpan>> = Mutex::new(None);
+static DISPLAY_LAYOUT: Mutex<Option<([i32; 4], u32)>> = Mutex::new(None);
 static LAYOUT_WATCH: Mutex<Option<LayoutWatch>> = Mutex::new(None);
 
 struct LayoutWatch {
@@ -197,11 +191,6 @@ type SetWindowCompositionAttributeFn =
 type GetWindowCompositionAttributeFn =
     unsafe extern "system" fn(HWND, *mut WindowCompositionAttributeData) -> i32;
 
-type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
-type GetChildCountFn = unsafe extern "system" fn(*mut c_void, *mut i32) -> i32;
-type AccLocationFn =
-    unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32, *mut i32, *mut i32, VARIANT) -> i32;
-
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -257,27 +246,33 @@ pub fn set_preference(enabled: bool) -> Result<(), String> {
     set_preference_for(CENTER_VALUE, enabled)
 }
 
-pub fn acrylic_preference_enabled() -> bool {
-    preference_enabled_for(ACRYLIC_VALUE)
-}
-
 pub fn set_acrylic_preference(enabled: bool) -> Result<(), String> {
     set_preference_for(ACRYLIC_VALUE, enabled)
 }
 
-pub unsafe fn initialize() {
-    let result = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
-    if result >= 0 {
-        COM_INITIALIZED.store(true, Ordering::Release);
-    }
-}
-
 pub unsafe fn shutdown() {
     stop_layout_watch();
-    rebar::release();
-    if COM_INITIALIZED.swap(false, Ordering::AcqRel) {
-        CoUninitialize();
+    // WM_DESTROY can be dispatched reentrantly during a native layout call.
+    // Retry after DispatchMessage has unwound and released its layout locks.
+    if !restore_left() {
+        let pending = BAND_PLACEMENT.try_lock().ok().and_then(|saved| *saved);
+        if let Some(placement) = pending {
+            let expected = Band {
+                header: placement.applied,
+                ..placement.band
+            };
+            // At most one fresh attempt per shutdown, never a polling loop.
+            if rebar::restore_header_on_exit(expected, placement.original) {
+                if let Ok(mut saved) = BAND_PLACEMENT.try_lock() {
+                    if *saved == Some(placement) {
+                        *saved = None;
+                    }
+                }
+            }
+        }
     }
+    restore_acrylic();
+    rebar::release();
 }
 
 unsafe extern "system" fn taskbar_layout_changed(
@@ -319,7 +314,7 @@ unsafe extern "system" fn taskbar_layout_changed(
 pub unsafe fn watch_layout(receiver: HWND, message: u32) {
     let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
     let process = window_process(taskbar);
-    let Ok(mut saved) = LAYOUT_WATCH.lock() else {
+    let Ok(mut saved) = LAYOUT_WATCH.try_lock() else {
         return;
     };
     if saved.as_ref().is_some_and(|watch| {
@@ -374,7 +369,7 @@ pub unsafe fn watch_layout(receiver: HWND, message: u32) {
 }
 
 pub fn acknowledge_layout_change() {
-    if let Ok(mut watch) = LAYOUT_WATCH.lock() {
+    if let Ok(mut watch) = LAYOUT_WATCH.try_lock() {
         if let Some(watch) = watch.as_mut() {
             watch.queued = false;
         }
@@ -382,7 +377,7 @@ pub fn acknowledge_layout_change() {
 }
 
 pub unsafe fn stop_layout_watch() {
-    if let Ok(mut saved) = LAYOUT_WATCH.lock() {
+    if let Ok(mut saved) = LAYOUT_WATCH.try_lock() {
         if let Some(watch) = saved.take() {
             for hook in watch.hooks {
                 UnhookWinEvent(hook);
@@ -467,7 +462,7 @@ pub unsafe fn apply_acrylic() -> bool {
         return false;
     };
     let originals = ORIGINAL_TASKBAR_POLICIES.get_or_init(|| Mutex::new(Vec::new()));
-    let Ok(mut originals) = originals.lock() else {
+    let Ok(mut originals) = originals.try_lock() else {
         return false;
     };
 
@@ -529,7 +524,7 @@ pub unsafe fn restore_acrylic() -> bool {
         return false;
     };
     let originals = ORIGINAL_TASKBAR_POLICIES.get_or_init(|| Mutex::new(Vec::new()));
-    let Ok(mut originals) = originals.lock() else {
+    let Ok(mut originals) = originals.try_lock() else {
         return false;
     };
 
@@ -565,61 +560,12 @@ unsafe fn find_task_list() -> Option<(HWND, HWND, HWND)> {
     }
 }
 
-unsafe fn task_button_bounds(task_list: HWND, taskbar_rect: RECT) -> Option<(i32, i32)> {
-    let mut object = null_mut();
-    let result = AccessibleObjectFromWindow(
-        task_list,
-        OBJID_CLIENT as u32,
-        &IID_IACCESSIBLE,
-        &mut object,
-    );
-    if result < 0 || object.is_null() {
-        return None;
-    }
-
-    let vtable = *(object as *mut *const usize);
-    let release: ReleaseFn = transmute(*vtable.add(2));
-    let get_child_count: GetChildCountFn = transmute(*vtable.add(8));
-    let acc_location: AccLocationFn = transmute(*vtable.add(22));
-
-    let mut count = 0;
-    if get_child_count(object, &mut count) < 0 || count <= 0 {
-        release(object);
-        return None;
-    }
-
-    let mut first = i32::MAX;
-    let mut last = i32::MIN;
-    for id in 1..=count {
-        let mut child: VARIANT = zeroed();
-        child.Anonymous.Anonymous.vt = VT_I4;
-        child.Anonymous.Anonymous.Anonymous.lVal = id;
-
-        let mut left = 0;
-        let mut top = 0;
-        let mut width = 0;
-        let mut height = 0;
-        if acc_location(object, &mut left, &mut top, &mut width, &mut height, child) >= 0
-            && width > 0
-            && height > 0
-            && top < taskbar_rect.bottom
-            && top.saturating_add(height) > taskbar_rect.top
-        {
-            first = first.min(left);
-            last = last.max(left.saturating_add(width));
-        }
-    }
-    release(object);
-
-    if first < last {
-        Some((first, last))
-    } else {
-        None
-    }
-}
-
 unsafe fn reduce_right_boundary(taskbar: HWND, class_name: &str, left: i32, right: &mut i32) {
-    let window = FindWindowExW(taskbar, 0, wide(class_name).as_ptr(), null());
+    let window = if class_name == "HiCodex.TaskbarWidget" {
+        FindWindowW(wide(class_name).as_ptr(), null())
+    } else {
+        FindWindowExW(taskbar, 0, wide(class_name).as_ptr(), null())
+    };
     let mut rect: RECT = zeroed();
     if window != 0
         && GetWindowRect(window, &mut rect) != 0
@@ -630,14 +576,18 @@ unsafe fn reduce_right_boundary(taskbar: HWND, class_name: &str, left: i32, righ
     }
 }
 
+pub fn invalidate_measurement() {
+    if let Ok(mut span) = BUTTON_SPAN.try_lock() {
+        *span = None;
+    }
+    crate::taskbar_measurement::invalidate();
+}
+
 pub unsafe fn apply_centered() -> bool {
-    if !COM_INITIALIZED.load(Ordering::Acquire) {
+    if !load_recovery() {
         return false;
     }
     let Some((taskbar, task_switch, task_list)) = find_task_list() else {
-        return false;
-    };
-    let Some(band) = rebar::task_band(GetParent(task_switch), task_switch) else {
         return false;
     };
     let mut taskbar_rect: RECT = zeroed();
@@ -651,7 +601,37 @@ pub unsafe fn apply_centered() -> bool {
         return false;
     }
 
-    let bounds = task_button_bounds(task_list, taskbar_rect);
+    // RDP can resize the existing taskbar without changing any HWND or PID.
+    // Cached button widths must not survive a display-coordinate change.
+    let display = (
+        [
+            taskbar_rect.left,
+            taskbar_rect.top,
+            taskbar_rect.right,
+            taskbar_rect.bottom,
+        ],
+        windows_sys::Win32::UI::HiDpi::GetDpiForWindow(taskbar),
+    );
+    let changed = if let Ok(mut previous) = DISPLAY_LAYOUT.try_lock() {
+        let changed = previous.is_some_and(|old| old != display);
+        *previous = Some(display);
+        changed
+    } else {
+        return false;
+    };
+    if changed {
+        invalidate_measurement();
+        restore_left();
+        // Geometry was read before restoring the header. Measure next pass.
+        return false;
+    }
+
+    let Some(band) = rebar::task_band(GetParent(task_switch), task_switch) else {
+        return false;
+    };
+    let bounds = crate::taskbar_measurement::bounds(task_list, taskbar_rect, band.process);
+    // An asynchronous result is only valid for the exact geometry it measured.
+
     let mut latest_list: RECT = zeroed();
     let mut latest_switch: RECT = zeroed();
     if GetWindowRect(task_list, &mut latest_list) == 0
@@ -717,7 +697,18 @@ pub unsafe fn apply_centered() -> bool {
     }
     let previous = *saved;
     // Record ownership before sending: a timed-out control may still apply it.
-    *saved = Some(BandPlacement::after_change(previous, band, target));
+    let next = BandPlacement::after_change(previous, band, target);
+    let Some(record) = crate::taskbar_recovery::Record::new(band, next.original, target) else {
+        return false;
+    };
+    if !crate::taskbar_recovery::ensure_guardian() {
+        return false;
+    }
+    // Persist before changing Explorer. Failure leaves the current layout intact.
+    if !crate::taskbar_recovery::save(record) {
+        return false;
+    }
+    *saved = Some(next);
     if rebar::set_header(band, target) {
         return true;
     }
@@ -725,11 +716,57 @@ pub unsafe fn apply_centered() -> bool {
         .is_some_and(|current| current.same_owner(band) && current.header == band.header)
     {
         *saved = previous;
+        if let Some(previous) = previous {
+            if let Some(record) = crate::taskbar_recovery::Record::new(
+                previous.band,
+                previous.original,
+                previous.applied,
+            ) {
+                crate::taskbar_recovery::save(record);
+            }
+        } else {
+            crate::taskbar_recovery::clear();
+        }
     }
     false
 }
 
+pub fn load_recovery() -> bool {
+    static PENDING: OnceLock<Mutex<Option<crate::taskbar_recovery::Record>>> = OnceLock::new();
+    let pending = PENDING.get_or_init(|| Mutex::new(crate::taskbar_recovery::load()));
+    let Ok(mut pending) = pending.try_lock() else {
+        return false;
+    };
+    let Some(record) = *pending else {
+        return true;
+    };
+    let Ok(mut saved) = BAND_PLACEMENT.try_lock() else {
+        return false;
+    };
+    // A changed/restarted Explorer cannot still own the recorded reservation.
+    if unsafe { window_process(record.band.window) } != record.band.process {
+        *pending = None;
+        return true;
+    }
+    let Some(current) = (unsafe { rebar::task_band(record.band.window, record.band.child) }) else {
+        // Preserve the pending baseline until Explorer can be queried.
+        return false;
+    };
+    if unsafe { record.matches(current) } {
+        *saved = Some(BandPlacement {
+            band: record.band,
+            original: record.original,
+            applied: current.header,
+        });
+    }
+    *pending = None;
+    true
+}
+
 pub unsafe fn restore_left() -> bool {
+    if !load_recovery() {
+        return false;
+    }
     let Ok(mut saved) = BAND_PLACEMENT.try_lock() else {
         return false;
     };
@@ -753,6 +790,9 @@ pub unsafe fn restore_left() -> bool {
         return true;
     }
     if !rebar::set_header(current, placement.original) {
+        return false;
+    }
+    if !crate::taskbar_recovery::clear() {
         return false;
     }
     *saved = None;
@@ -797,6 +837,24 @@ mod placement_tests {
         centered_band_header, centered_group_left, remember_button_span, AccentPlacement,
         AccentPolicy, Band, BandPlacement, ButtonSpan,
     };
+
+    #[test]
+    fn reentrant_acrylic_restore_skips_the_busy_record_without_waiting() {
+        use super::*;
+        let held = ORIGINAL_TASKBAR_POLICIES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = unsafe { restore_acrylic() };
+            send.send(result).unwrap();
+        });
+        let returned = receive.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        worker.join().unwrap();
+        assert!(!returned.unwrap());
+    }
 
     #[test]
     fn temporary_missing_buttons_keep_last_geometry_until_window_is_recreated() {
@@ -855,7 +913,7 @@ mod placement_tests {
             );
             assert_ne!(receiver, 0);
             let message = WM_APP + 88;
-            *LAYOUT_WATCH.lock().unwrap() = Some(LayoutWatch {
+            *LAYOUT_WATCH.try_lock().unwrap() = Some(LayoutWatch {
                 taskbar: receiver,
                 process: 42,
                 receiver,
@@ -893,7 +951,7 @@ mod placement_tests {
             assert!(BUTTON_SPAN.lock().unwrap().is_some());
             taskbar_layout_changed(0, EVENT_OBJECT_DESTROY, receiver, OBJID_WINDOW, 0, 0, 0);
             assert!(BUTTON_SPAN.lock().unwrap().is_none());
-            *LAYOUT_WATCH.lock().unwrap() = None;
+            *LAYOUT_WATCH.try_lock().unwrap() = None;
             taskbar_layout_changed(0, EVENT_OBJECT_LOCATIONCHANGE, receiver, 0, 0, 0, 0);
             assert_eq!(
                 PeekMessageW(&mut received, receiver, message, message, PM_REMOVE),

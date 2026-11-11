@@ -1,9 +1,12 @@
 //! Native task-band layout. WM_USER control messages do not marshal pointers
 //! across processes, so their small data-only buffer must live in the owner.
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{
@@ -18,13 +21,51 @@ use windows_sys::Win32::UI::Controls::{
     RB_GETBANDCOUNT, RB_GETBANDINFOW, RB_SETBANDINFOW, REBARBANDINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
-    SMTO_ERRORONEXIT,
+    GetClassNameW, GetWindowThreadProcessId, MsgWaitForMultipleObjectsEx, PeekMessageW,
+    SendMessageCallbackW, MSG, PM_NOREMOVE, QS_SENDMESSAGE,
 };
+#[cfg(test)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG};
 
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
+static NEXT_CALLBACK: AtomicUsize = AtomicUsize::new(1);
+static COMPLETIONS: OnceLock<Mutex<HashMap<usize, Arc<Completion>>>> = OnceLock::new();
+
+#[derive(Default)]
+struct Completion {
+    result: AtomicUsize,
+    done: AtomicBool,
+}
+
+struct Pending {
+    id: usize,
+    completion: Arc<Completion>,
+}
+
+fn completions() -> &'static Mutex<HashMap<usize, Arc<Completion>>> {
+    COMPLETIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe extern "system" fn native_completed(_window: HWND, _message: u32, id: usize, result: isize) {
+    if let Some(completion) = completions()
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.remove(&id))
+    {
+        completion.result.store(result as usize, Ordering::Relaxed);
+        completion.done.store(true, Ordering::Release);
+    }
+}
+
+unsafe fn pump_sent_messages() {
+    // Dispatch sent messages/callbacks, leaving all normal queued UI messages
+    // for the application's main loop. Reentrant layout calls use try_lock.
+    let mut message: MSG = zeroed();
+    PeekMessageW(&mut message, 0, 0, 0, PM_NOREMOVE);
+}
 // The header-size version of the SDK structure (REBARBANDINFO_V6_SIZE).
 // Older common controls reject the later chevron fields' full structure size.
+const NATIVE_BUDGET: Duration = Duration::from_millis(250);
 const BAND_INFO_SIZE: u32 =
     (std::mem::offset_of!(REBARBANDINFOW, cxHeader) + size_of::<u32>()) as u32;
 
@@ -52,6 +93,8 @@ struct Client {
     // An address in the target process, never dereferenced in this process.
     buffer: usize,
     quarantined: bool,
+    pending: Option<Pending>,
+    deadline: Instant,
 }
 
 impl Client {
@@ -103,6 +146,8 @@ impl Client {
             process,
             buffer: buffer as usize,
             quarantined: false,
+            pending: None,
+            deadline: Instant::now() + NATIVE_BUDGET,
         })
     }
 
@@ -115,27 +160,66 @@ impl Client {
     }
 
     unsafe fn send(&mut self, message: u32, index: usize, data: isize) -> Option<usize> {
+        // A deadline does not mean the receiver stopped using our pointer.
+        // Recover the *same* buffer only after its actual completion callback.
+        if self.quarantined {
+            pump_sent_messages();
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.completion.done.load(Ordering::Acquire))
+            {
+                self.pending = None;
+                self.quarantined = false;
+            }
+        }
         if self.quarantined || !self.matches(self.window) {
             return None;
         }
-        let mut result = 0;
-        if SendMessageTimeoutW(
+        let remaining = self.deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        let completion = Arc::new(Completion::default());
+        let id = NEXT_CALLBACK.fetch_add(1, Ordering::Relaxed);
+        completions().lock().ok()?.insert(id, completion.clone());
+        if SendMessageCallbackW(
             self.window,
             message,
             index,
             data,
-            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-            250,
-            &mut result,
+            Some(native_completed),
+            id,
         ) == 0
         {
-            // A timed-out receiver may still be using the pointer. Do not free
-            // or reuse it. Keep this one client blocked until its owner changes;
-            // the tiny allocation is reclaimed when Explorer exits.
-            self.quarantined = true;
+            if let Ok(mut pending) = completions().lock() {
+                pending.remove(&id);
+            }
+            crate::diagnostics::record(crate::diagnostics::Event::NativeBand, 1);
             return None;
         }
-        Some(result)
+        self.pending = Some(Pending {
+            id,
+            completion: completion.clone(),
+        });
+        loop {
+            pump_sent_messages();
+            if completion.done.load(Ordering::Acquire) {
+                self.pending = None;
+                crate::diagnostics::record(crate::diagnostics::Event::NativeBand, 0);
+                return Some(completion.result.load(Ordering::Relaxed));
+            }
+            let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+                self.quarantined = true;
+                crate::diagnostics::record(crate::diagnostics::Event::NativeBand, 1);
+                return None;
+            };
+            let timeout = remaining.as_millis().max(1).min(u32::MAX as u128) as u32;
+            if MsgWaitForMultipleObjectsEx(1, &self.process, timeout, QS_SENDMESSAGE, 0) == 0 {
+                self.quarantined = true;
+                return None;
+            }
+        }
     }
 
     unsafe fn exchange(&mut self, message: u32, index: usize, info: &mut REBARBANDINFOW) -> bool {
@@ -223,8 +307,17 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         unsafe {
-            if !self.quarantined {
+            let complete = self
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.completion.done.load(Ordering::Acquire));
+            if !self.quarantined || complete {
                 VirtualFreeEx(self.process, self.buffer as *mut c_void, 0, MEM_RELEASE);
+            }
+            if let Some(pending) = &self.pending {
+                if let Ok(mut callbacks) = completions().lock() {
+                    callbacks.remove(&pending.id);
+                }
             }
             CloseHandle(self.process);
         }
@@ -236,7 +329,9 @@ unsafe fn with_client<T>(window: HWND, action: impl FnOnce(&mut Client) -> Optio
     if !saved.as_ref().is_some_and(|client| client.matches(window)) {
         *saved = Client::open(window);
     }
-    action(saved.as_mut()?)
+    let client = saved.as_mut()?;
+    client.deadline = Instant::now() + NATIVE_BUDGET;
+    action(client)
 }
 
 pub unsafe fn task_band(window: HWND, child: HWND) -> Option<Band> {
@@ -248,6 +343,19 @@ pub unsafe fn set_header(expected: Band, header: u32) -> bool {
         Some(client.set_header(expected, header))
     })
     .unwrap_or(false)
+}
+
+// Final shutdown only: the cached client may be quarantined by an earlier
+// timeout. Use one fresh buffer, preserving the old receiver's pointer. Exact
+// ownership/header checks still refuse to overwrite an external layout change.
+pub unsafe fn restore_header_on_exit(expected: Band, original: u32) -> bool {
+    let Some(mut client) = Client::open(expected.window) else {
+        return false;
+    };
+    client.set_header(expected, original)
+        && client
+            .band(expected.child)
+            .is_some_and(|(_, band)| band.same_owner(expected) && band.header == original)
 }
 
 pub fn release() {
@@ -284,6 +392,19 @@ mod tests {
     const ARM_DELAY: u32 = WM_APP + 77;
     static ORIGINAL_PROC: AtomicIsize = AtomicIsize::new(0);
     static DELAY_NEXT: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn exhausted_native_budget_does_not_send_or_quarantine_a_safe_buffer() {
+        let fixture = Fixture::new();
+        unsafe {
+            let mut client = Client::open(fixture.rebar).unwrap();
+            client.deadline = Instant::now() - Duration::from_millis(1);
+            assert!(client.band(fixture.child).is_none());
+            assert!(!client.quarantined);
+            client.deadline = Instant::now() + NATIVE_BUDGET;
+            assert!(client.band(fixture.child).is_some());
+        }
+    }
 
     #[test]
     fn release_does_not_wait_for_a_client_held_by_a_native_call() {
@@ -490,6 +611,41 @@ mod tests {
     }
 
     #[test]
+    fn repeated_native_queries_reuse_and_release_the_remote_buffer() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_FREE,
+        };
+        use windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
+
+        let fixture = Fixture::new();
+        unsafe {
+            let mut client = Client::open(fixture.rebar).unwrap();
+            let observer = OpenProcess(PROCESS_QUERY_INFORMATION, 0, fixture.process.id());
+            assert_ne!(observer, 0);
+            let address = client.buffer;
+            for _ in 0..2000 {
+                client.deadline = Instant::now() + NATIVE_BUDGET;
+                assert!(client.band(fixture.child).is_some());
+                assert_eq!(client.buffer, address);
+            }
+            let mut region: MEMORY_BASIC_INFORMATION = zeroed();
+            let size = size_of::<MEMORY_BASIC_INFORMATION>();
+            assert_ne!(
+                VirtualQueryEx(observer, address as *const c_void, &mut region, size),
+                0
+            );
+            assert_eq!(region.State, MEM_COMMIT);
+            drop(client);
+            assert_ne!(
+                VirtualQueryEx(observer, address as *const c_void, &mut region, size),
+                0
+            );
+            assert_eq!(region.State, MEM_FREE);
+            CloseHandle(observer);
+        }
+    }
+
+    #[test]
     fn native_reservation_survives_child_reset_and_notification_area_resizes() {
         let fixture = Fixture::new();
         unsafe {
@@ -556,6 +712,7 @@ mod tests {
                 );
                 // No correction callback or timer runs between reset and assertion.
                 assert_eq!(fixture.rect(fixture.list).left, base + 400);
+                client.deadline = Instant::now() + NATIVE_BUDGET;
                 assert_eq!(client.band(fixture.child).unwrap().1.header, 400);
             }
             let applied = client.band(fixture.child).unwrap().1;
@@ -575,6 +732,29 @@ mod tests {
             assert!(client.set_header(ours, 120));
             assert!(!client.set_header(ours, original.header));
             assert_eq!(client.band(fixture.child).unwrap().1.header, 120);
+        }
+    }
+
+    #[test]
+    fn final_restore_can_recover_a_quarantined_client_without_overwriting_external_changes() {
+        let fixture = Fixture::new();
+        unsafe {
+            let mut client = Client::open(fixture.rebar).unwrap();
+            let original = client.band(fixture.child).unwrap().1;
+            assert!(client.set_header(original, 400));
+            let applied = client.band(fixture.child).unwrap().1;
+            assert!(client.send(ARM_DELAY, 0, 0).is_some());
+            assert!(client.band(fixture.child).is_none());
+            assert!(client.quarantined);
+            std::thread::sleep(Duration::from_millis(850));
+            assert!(restore_header_on_exit(applied, original.header));
+            assert!(client.quarantined);
+            let mut observer = Client::open(fixture.rebar).unwrap();
+            let restored = observer.band(fixture.child).unwrap().1;
+            assert_eq!(restored.header, original.header);
+            assert!(observer.set_header(restored, 120));
+            assert!(!restore_header_on_exit(applied, original.header));
+            assert_eq!(observer.band(fixture.child).unwrap().1.header, 120);
         }
     }
 
@@ -604,6 +784,23 @@ mod tests {
             );
             CloseHandle(process);
             assert_ne!(readable, 0);
+        }
+    }
+
+    #[test]
+    fn temporary_native_timeout_recovers_the_same_buffer_after_completion() {
+        let fixture = Fixture::new();
+        unsafe {
+            let mut client = Client::open(fixture.rebar).unwrap();
+            let address = client.buffer;
+            assert!(client.send(ARM_DELAY, 0, 0).is_some());
+            assert!(client.band(fixture.child).is_none());
+            assert!(client.quarantined);
+            std::thread::sleep(Duration::from_millis(850));
+            client.deadline = Instant::now() + NATIVE_BUDGET;
+            assert!(client.band(fixture.child).is_some());
+            assert!(!client.quarantined);
+            assert_eq!(client.buffer, address);
         }
     }
 }

@@ -59,7 +59,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Stable releases must be merged into main first.' }
           }
           $manifest = Get-Content -LiteralPath Cargo.toml -Raw
-          if ($manifest -notmatch ('(?m)^version = "' + [regex]::Escape($tag.Substring(1)) + '"$')) {
+          if ($manifest -notmatch ('(?m)^version = "' + [regex]::Escape($tag.Substring(1)) + '"\r?$')) {
             throw 'Tag and package version do not match.'
           }
           $notes = "docs/releases/$tag.md"
@@ -70,8 +70,18 @@ jobs:
           Copy-Item -LiteralPath artifact/hicodex.exe -Destination package/HiCodex.exe
           Copy-Item -LiteralPath LICENSE -Destination package/LICENSE
           Copy-Item -LiteralPath $notes -Destination package/README.md
+          $localizedNotes = "docs/releases/$tag.zh-CN.md"
+          if (Test-Path -LiteralPath $localizedNotes) {
+            Copy-Item -LiteralPath $localizedNotes -Destination package/README.zh-CN.md
+          }
+          New-Item -ItemType Directory -Path package/screenshots | Out-Null
+          Copy-Item -Path "assets/screenshots/*-$($tag.Substring(1)).png" -Destination package/screenshots
+          Get-ChildItem package/README*.md | ForEach-Object {
+            (Get-Content -LiteralPath $_.FullName -Raw).Replace('../../assets/screenshots/', 'screenshots/').Replace("https://github.com/fangzh5/hi-codex/blob/$tag/docs/releases/$tag.zh-CN.md", 'README.zh-CN.md').Replace("($tag.md)", '(README.md)') | Set-Content -LiteralPath $_.FullName -Encoding utf8
+          }
+          (Get-Content -LiteralPath $notes -Raw).Replace('../../assets/screenshots/', "https://raw.githubusercontent.com/fangzh5/hi-codex/$tag/assets/screenshots/") | Set-Content release-notes.md -Encoding utf8
           $zip = "HiCodex-$tag-windows-x64.zip"
-          Compress-Archive -LiteralPath package/HiCodex.exe,package/LICENSE,package/README.md -DestinationPath $zip
+          Compress-Archive -Path package/* -DestinationPath $zip
           $checksums = @(
             "$( (Get-FileHash -LiteralPath package/HiCodex.exe -Algorithm SHA256).Hash.ToLowerInvariant() )  HiCodex.exe"
             "$( (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() )  $zip"
@@ -84,8 +94,8 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           if ($tag -match '-beta\.') {
-            gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --prerelease --latest=false --title "HiCodex $tag (experimental)" --notes-file "docs/releases/$tag.md"
+            gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --prerelease --latest=false --title "HiCodex $tag (experimental)" --notes-file release-notes.md
           } else {
-            gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --latest --title "HiCodex $tag" --notes-file "docs/releases/$tag.md"
+            gh release create $tag package/HiCodex.exe "HiCodex-$tag-windows-x64.zip" SHA256SUMS.txt --verify-tag --latest --title "HiCodex $tag" --notes-file release-notes.md
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

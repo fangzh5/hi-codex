@@ -1,6 +1,6 @@
 [package]
 name = "hicodex"
-version = "0.4.1"
+version = "0.6.0"
 edition = "2021"
 description = "A lightweight Windows taskbar meter for Codex limits and optional system usage"
 license = "MIT"
@@ -21,9 +21,11 @@ windows-sys = { version = "0.52", features = [
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_LibraryLoader",
     "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Ole",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
@@ -41,6 +43,9 @@ windows-sys = { version = "0.52", features = [
 
 [build-dependencies]
 winres = "0.1"
+
+[dev-dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_ProcessStatus"] }
 
 [profile.release]
 opt-level = "z"

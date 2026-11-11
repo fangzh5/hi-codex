@@ -1,18 +1,25 @@
 use crate::quota::{parse_rate_limit_response, UsageSnapshot};
 use serde_json::{json, Value};
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ATTEMPTS: usize = 3;
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+// HiCodex requests only account metadata and quotas. Bound both the pipe reader
+// and the pending queue so a noisy or malformed server cannot grow memory or
+// keep a reader busy indefinitely while the browser is open.
+const MAX_SERVER_LINE_BYTES: usize = 256 * 1024;
+const MAX_SERVER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SERVER_MESSAGES: usize = 1024;
+const MAX_PENDING_MESSAGES: usize = 16;
 
 #[derive(Clone, Default)]
 pub struct AccountSummary {
@@ -179,6 +186,9 @@ fn start_app_server(home: Option<&Path>) -> Result<Child, String> {
         if let Some(home) = home {
             command
                 .env("CODEX_HOME", home)
+                .current_dir(home)
+                .env_remove("OPENAI_API_KEY")
+                .env_remove("CODEX_API_KEY")
                 .args(["-c", "cli_auth_credentials_store=\"file\""]);
         }
         match command
@@ -209,6 +219,40 @@ struct AppServerSession {
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
+fn read_server_messages(mut stdout: impl BufRead, sender: SyncSender<Value>) {
+    let mut line = Vec::new();
+    let mut remaining = MAX_SERVER_OUTPUT_BYTES;
+    for _ in 0..MAX_SERVER_MESSAGES {
+        let limit = remaining.min(MAX_SERVER_LINE_BYTES);
+        if limit == 0 {
+            break;
+        }
+        line.clear();
+        // A limit on read_until itself is necessary: checking a String after
+        // .lines() has read it would still allocate an arbitrarily large line.
+        let read = match (&mut stdout)
+            .take((limit + 1) as u64)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) | Err(_) => break,
+            Ok(read) if read > limit => break,
+            Ok(read) => read,
+        };
+        remaining -= read;
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if value.get("id").is_none() && value["method"] != "account/login/completed" {
+            continue;
+        }
+        // Never block here: Drop kills the server and joins this thread before
+        // dropping the receiver. A blocking bounded send would deadlock cleanup.
+        if sender.try_send(value).is_err() {
+            break;
+        }
+    }
+}
+
 impl AppServerSession {
     fn start(home: Option<&Path>) -> Result<Self, String> {
         let mut child = start_app_server(home)?;
@@ -222,15 +266,9 @@ impl AppServerSession {
             let _ = child.wait();
             return Err("Codex App Server stdout was unavailable".into());
         };
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
         let reader = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                    if sender.send(value).is_err() {
-                        break;
-                    }
-                }
-            }
+            read_server_messages(BufReader::new(stdout), sender);
         });
         Ok(Self {
             child,
@@ -360,11 +398,15 @@ pub fn sign_in(
     wait_for_login(&session.receiver, id, Duration::from_secs(180), cancel)
 }
 
-fn fetch_usage_once(cancel: Option<&AtomicBool>) -> Result<UsageResult, String> {
+fn fetch_usage_once(
+    home: Option<&Path>,
+    expected_workspace: Option<&str>,
+    cancel: Option<&AtomicBool>,
+) -> Result<UsageResult, String> {
     if cancelled(cancel) {
         return Err("Usage refresh cancelled for account management".into());
     }
-    let mut session = AppServerSession::start(None)?;
+    let mut session = AppServerSession::start(home)?;
     initialize(&mut session, cancel)?;
     send(
         &mut session.stdin,
@@ -382,12 +424,32 @@ fn fetch_usage_once(cancel: Option<&AtomicBool>) -> Result<UsageResult, String> 
     )?;
     let limits_response =
         wait_for_response_cancellable(&session.receiver, 3, REQUEST_TIMEOUT, cancel)?;
+    validate_usage_workspace(&limits_response, expected_workspace)?;
     let usage = parse_rate_limit_response(&limits_response)?;
 
     Ok(UsageResult {
         usage,
         account: parse_account(&account_response),
     })
+}
+
+fn validate_usage_workspace(response: &Value, expected: Option<&str>) -> Result<(), String> {
+    if let (Some(expected), Some(actual)) = (expected, response["result"]["accountId"].as_str()) {
+        if expected != actual {
+            return Err("Usage response belongs to another workspace; result discarded".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn fetch_usage_for_home(
+    home: &Path,
+    workspace: &str,
+    cancel: &AtomicBool,
+) -> Result<UsageResult, String> {
+    // Saved-account batches apply their own retry interval. Do not multiply the
+    // normal current-account retries by the number of stored accounts.
+    fetch_usage_once(Some(home), Some(workspace), Some(cancel))
 }
 
 pub fn fetch_usage() -> Result<UsageResult, String> {
@@ -402,7 +464,7 @@ fn fetch_usage_impl(cancel: Option<&AtomicBool>) -> Result<UsageResult, String> 
     let mut last_error = None;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match fetch_usage_once(cancel) {
+        match fetch_usage_once(None, None, cancel) {
             Ok(result) => return Ok(result),
             Err(error) => last_error = Some(error),
         }
@@ -434,6 +496,84 @@ fn fetch_usage_impl(cancel: Option<&AtomicBool>) -> Result<UsageResult, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_account_usage_rejects_a_different_workspace() {
+        assert!(validate_usage_workspace(
+            &json!({"result":{"accountId":"other"}}),
+            Some("expected")
+        )
+        .is_err());
+        assert!(validate_usage_workspace(
+            &json!({"result":{"accountId":"expected"}}),
+            Some("expected")
+        )
+        .is_ok());
+        assert!(validate_usage_workspace(&json!({"result":{}}), Some("expected")).is_ok());
+    }
+
+    #[test]
+    fn server_reader_filters_notifications_but_preserves_login_completion_and_responses() {
+        let mut output = Vec::new();
+        for _ in 0..100 {
+            send(&mut output, &json!({"method": "unrelated/updated"})).unwrap();
+        }
+        let completion = json!({"method": "account/login/completed", "params": {"loginId": "expected", "success": true}});
+        let response = json!({"id": 2, "result": {"type": "chatgpt"}});
+        send(&mut output, &completion).unwrap();
+        send(&mut output, &response).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
+        read_server_messages(std::io::Cursor::new(output), sender);
+        assert_eq!(receiver.recv().unwrap(), completion);
+        assert_eq!(receiver.recv().unwrap(), response);
+        assert!(receiver.recv().is_err());
+    }
+
+    #[test]
+    fn full_server_queue_exits_without_blocking_cleanup() {
+        let mut output = Vec::new();
+        for id in 0..MAX_PENDING_MESSAGES * 100 {
+            send(&mut output, &json!({"id": id, "result": {}})).unwrap();
+        }
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
+        let (finished, completion) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            read_server_messages(std::io::Cursor::new(output), sender);
+            let _ = finished.send(());
+        });
+        assert!(completion.recv_timeout(Duration::from_secs(2)).is_ok());
+        reader.join().unwrap();
+        assert_eq!(receiver.iter().count(), MAX_PENDING_MESSAGES);
+    }
+
+    #[test]
+    fn server_reader_bounds_unterminated_lines_and_unending_notifications() {
+        let mut oversized = std::io::Cursor::new(vec![b'x'; MAX_SERVER_LINE_BYTES * 4]);
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
+        read_server_messages(&mut oversized, sender);
+        assert_eq!(oversized.position() as usize, MAX_SERVER_LINE_BYTES + 1);
+        assert!(receiver.recv().is_err());
+
+        // Even an endless stream of valid irrelevant messages must terminate.
+        let notification = b"{\"method\":\"unrelated/updated\"}\n";
+        let mut output = std::io::Cursor::new(notification.repeat(MAX_SERVER_MESSAGES * 2));
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
+        read_server_messages(&mut output, sender);
+        assert_eq!(
+            output.position() as usize,
+            notification.len() * MAX_SERVER_MESSAGES
+        );
+        assert!(receiver.recv().is_err());
+
+        let notification = format!(
+            "{{\"method\":\"unrelated/updated\",\"data\":\"{}\"}}\n",
+            "x".repeat(MAX_SERVER_LINE_BYTES / 2)
+        );
+        let mut output = std::io::Cursor::new(notification.repeat(32).into_bytes());
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
+        read_server_messages(&mut output, sender);
+        assert_eq!(output.position() as usize, MAX_SERVER_OUTPUT_BYTES + 1);
+        assert!(receiver.recv().is_err());
+    }
 
     #[test]
     fn browser_login_accepts_only_supported_https_links() {

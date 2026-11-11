@@ -26,13 +26,15 @@ pub enum SaveCurrent {
 struct LoginDirectory {
     base: PathBuf,
     path: PathBuf,
+    retain: bool,
 }
 
 impl Drop for LoginDirectory {
     fn drop(&mut self) {
         // This is the unique directory created exclusively for this login.
         // Do not traverse a directory replaced by a reparse point.
-        if self.path.parent() == Some(self.base.as_path())
+        if !self.retain
+            && self.path.parent() == Some(self.base.as_path())
             && fs::symlink_metadata(&self.path)
                 .is_ok_and(|metadata| metadata.is_dir() && metadata.file_attributes() & 0x400 == 0)
         {
@@ -88,9 +90,11 @@ impl Account {
 pub struct AccountList {
     pub accounts: Vec<Account>,
     pub active_key: Option<String>,
+    #[allow(dead_code)] // Retained for legacy recovery compatibility and tests.
     pub can_restore: bool,
 }
 
+#[cfg(test)]
 pub struct ImportReport {
     pub added: usize,
     pub skipped: usize,
@@ -98,6 +102,8 @@ pub struct ImportReport {
 
 pub struct AccountManager {
     home: PathBuf,
+    #[cfg(test)]
+    allow_test_clients: bool,
 }
 
 pub fn codex_home() -> Result<PathBuf, String> {
@@ -225,6 +231,24 @@ fn fresh_store() -> Value {
     json!({"schema_version": 1, "accounts": [], "backup": null})
 }
 
+fn validate_usage_writeback(
+    key: &str,
+    original: &Value,
+    refreshed: &Value,
+    current: &Value,
+) -> Result<(), String> {
+    if identity(original)?.key != key || identity(refreshed)?.key != key {
+        return Err("Refreshed credentials belong to a different saved account".into());
+    }
+    if current != original {
+        return Err(
+            "Saved credentials changed during usage refresh; newer credentials were preserved"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn entry(auth: Value, alias: &str) -> Result<Value, String> {
     let account = identity(&auth)?;
     let alias = alias.trim();
@@ -272,10 +296,163 @@ fn require_file_config(config: &toml::Value) -> Result<(), String> {
 }
 
 impl AccountManager {
+    fn usage_recovery_path(&self, key: &str) -> Result<PathBuf, String> {
+        let (user, workspace) = key
+            .split_once("::")
+            .ok_or("Invalid saved account identity")?;
+        Ok(self.directory().join(format!(
+            "usage-recovery-{}.dpapi",
+            crate::desktop_state::owner_key(user, workspace)?
+        )))
+    }
+
+    fn recover_usage_credentials(&self, store: &mut Value, key: &str) -> Result<(), String> {
+        let path = self.usage_recovery_path(key)?;
+        let Some(encrypted) = read_optional_bounded(&path)? else {
+            return Ok(());
+        };
+        let recovery = json_bytes(&credential_storage::unprotect(&encrypted)?)?;
+        if identity(&recovery["original"])?.key != key
+            || identity(&recovery["refreshed"])?.key != key
+        {
+            return Err("Invalid quota credential recovery record".into());
+        }
+        let current = store["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["key"].as_str() == Some(key))
+            .ok_or("Account no longer exists")?;
+        if current["auth"] == recovery["original"] {
+            upsert(store, entry(recovery["refreshed"].clone(), "")?, true)?;
+            self.save(store)?;
+        }
+        // Already committed or a newer external login won. Never replace it.
+        fs::remove_file(path)
+            .map_err(|_| "Could not retire quota credential recovery record".to_owned())
+    }
+
+    pub fn fetch_saved_usage(
+        &self,
+        key: &str,
+        cancel: &AtomicBool,
+    ) -> Result<crate::rpc::UsageResult, String> {
+        self.fetch_saved_usage_using(key, cancel, |home, workspace| {
+            crate::rpc::fetch_usage_for_home(home, workspace, cancel)
+        })
+    }
+
+    fn fetch_saved_usage_using(
+        &self,
+        key: &str,
+        cancel: &AtomicBool,
+        fetch: impl FnOnce(&Path, &str) -> Result<crate::rpc::UsageResult, String>,
+    ) -> Result<crate::rpc::UsageResult, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("Saved-account refresh cancelled".into());
+        }
+        let auth = {
+            let _lock = self.operation_lock()?;
+            let mut store = self.load()?;
+            self.recover_usage_credentials(&mut store, key)?;
+            store["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["key"].as_str() == Some(key))
+                .ok_or("Account no longer exists")?["auth"]
+                .clone()
+        };
+        self.check_switch_config(&auth)?;
+        if self.list()?.active_key.as_deref() == Some(key) {
+            return Err("Account is currently active; use its current-login usage reader".into());
+        }
+        let base =
+            fs::canonicalize(self.directory()).map_err(|_| "Could not locate account storage")?;
+        let path = base.join(format!(
+            "usage-{}-{}",
+            std::process::id(),
+            NEXT_LOGIN.fetch_add(1, Ordering::Relaxed)
+        ));
+        credential_storage::create_private_directory(&path)?;
+        let mut staging = LoginDirectory {
+            base,
+            path,
+            retain: false,
+        };
+        credential_storage::atomic_create(
+            &staging.path.join("auth.json"),
+            &serde_json::to_vec(&auth).map_err(|_| "Could not prepare saved-account login")?,
+        )?;
+        let workspace = auth["tokens"]["account_id"]
+            .as_str()
+            .ok_or("Missing account workspace")?;
+        let result = fetch(&staging.path, workspace);
+        staging.retain = true;
+        // The App Server is already stopped when fetch returns. Capture rotated
+        // credentials even if the following quota request failed or was cancelled.
+        let refreshed = json_bytes(&read_bounded(&staging.path.join("auth.json"))?)?;
+        if identity(&refreshed)?.key != key {
+            return Err(
+                "Saved-account identity changed while reading usage; result discarded".into(),
+            );
+        }
+        if refreshed != auth {
+            let _lock = self.operation_lock()?;
+            let mut store = self.load()?;
+            let current = store["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["key"].as_str() == Some(key))
+                .ok_or("Account was removed during usage refresh")?;
+            if let Err(error) = validate_usage_writeback(key, &auth, &refreshed, &current["auth"]) {
+                staging.retain = false;
+                return Err(error);
+            }
+            let recovery_path = self.usage_recovery_path(key)?;
+            let recovery = credential_storage::protect(
+                &serde_json::to_vec(&json!({"original":auth,"refreshed":refreshed}))
+                    .map_err(|_| "Could not encode refreshed login")?,
+            )?;
+            if credential_storage::atomic_create(&recovery_path, &recovery).is_err() {
+                staging.retain = true;
+                return Err("Could not checkpoint renewed credentials. The private usage directory was retained for recovery; no newer login was overwritten.".into());
+            }
+            staging.retain = false;
+            upsert(&mut store, entry(refreshed, "")?, true)?;
+            self.save(&store)?;
+            fs::remove_file(recovery_path)
+                .map_err(|_| "Renewed credentials saved; recovery cleanup is pending")?;
+        }
+        staging.retain = false;
+        result
+    }
+
     pub fn current() -> Result<Self, String> {
         Ok(Self {
             home: codex_home()?,
+            #[cfg(test)]
+            allow_test_clients: false,
         })
+    }
+
+    fn require_stopped(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.allow_test_clients {
+            return Ok(());
+        }
+        crate::process_guard::require_stopped()
+    }
+
+    pub fn repair_local_history(&self) -> Result<bool, String> {
+        self.require_stopped()?;
+        let _lock = self.operation_lock()?;
+        let prepared =
+            crate::desktop_state::PreparedState::prepare_repair(&self.home, &self.directory())?;
+        prepared.backup(&self.directory())?;
+        self.require_stopped()?;
+        prepared.commit()
     }
 
     fn directory(&self) -> PathBuf {
@@ -472,7 +649,11 @@ impl AccountManager {
             NEXT_LOGIN.fetch_add(1, Ordering::Relaxed)
         ));
         credential_storage::create_private_directory(&path)?;
-        let staging = LoginDirectory { base, path };
+        let staging = LoginDirectory {
+            base,
+            path,
+            retain: false,
+        };
         login(&staging.path)?;
         check_cancel()?;
         let auth = json_bytes(&read_bounded(&staging.path.join("auth.json"))?)?;
@@ -485,17 +666,88 @@ impl AccountManager {
         self.save(&store)
     }
 
+    pub fn remove_saved(&self, key: &str) -> Result<(), String> {
+        let _lock = self.operation_lock()?;
+        let mut store = self.load()?;
+        let records = store["accounts"].as_array_mut().unwrap();
+        let before = records.len();
+        records.retain(|record| record["key"].as_str() != Some(key));
+        if records.len() == before {
+            return Err("Account no longer exists".into());
+        }
+        if ["auth", "target"]
+            .iter()
+            .any(|field| identity(&store["backup"][*field]).is_ok_and(|a| a.key == key))
+        {
+            store["backup"] = Value::Null;
+        }
+        self.save(&store)?;
+        let recovery = self.usage_recovery_path(key)?;
+        if read_optional_bounded(&recovery)?.is_some() {
+            fs::remove_file(recovery)
+                .map_err(|_| "Account removed, but quota credential cleanup is pending")?;
+        }
+        Ok(())
+    }
+
+    pub fn export_json(&self, path: &Path) -> Result<(), String> {
+        let _lock = self.operation_lock()?;
+        let mut store = self.load()?;
+        let live = read_optional_bounded(&self.auth_path())?;
+        if let Some(bytes) = &live {
+            let auth = json_bytes(bytes)?;
+            let key = identity(&auth)?.key;
+            if store["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["key"] == key)
+            {
+                upsert(&mut store, entry(auth, "")?, true)?;
+            }
+        }
+        let records = store["accounts"].as_array().unwrap();
+        if records.is_empty() {
+            return Err("No saved accounts to export".into());
+        }
+        let bytes =
+            serde_json::to_vec_pretty(&json!({"hicodex_export_version":1,"accounts":records}))
+                .map_err(|_| "Could not encode export")?;
+        if read_optional_bounded(&self.auth_path())? != live {
+            return Err("Login changed while preparing export. Please retry.".into());
+        }
+        credential_storage::atomic_create(path, &bytes)
+    }
+
     pub fn import_file(&self, path: &Path) -> Result<usize, String> {
         let auth = json_bytes(&read_bounded(path)?)?;
-        let values: Vec<Value> = if let Some(array) = auth.as_array() {
-            array.clone()
+        let incoming = if let Some(version) = auth.get("hicodex_export_version") {
+            if version.as_u64() != Some(1) {
+                return Err("Unsupported HiCodex export version".into());
+            }
+            let records = auth["accounts"]
+                .as_array()
+                .ok_or("Invalid HiCodex export")?;
+            records
+                .iter()
+                .map(|r| {
+                    let validated = entry(
+                        r["auth"].clone(),
+                        r["alias"].as_str().ok_or("Invalid account alias")?,
+                    )?;
+                    if validated["key"] != r["key"] {
+                        return Err("Export account identity mismatch".into());
+                    }
+                    Ok(validated)
+                })
+                .collect::<Result<Vec<_>, String>>()?
         } else {
-            vec![auth]
+            let values = auth.as_array().cloned().unwrap_or_else(|| vec![auth]);
+            values
+                .into_iter()
+                .map(|auth| entry(auth, ""))
+                .collect::<Result<Vec<_>, _>>()?
         };
-        let incoming = values
-            .into_iter()
-            .map(|auth| entry(auth, ""))
-            .collect::<Result<Vec<_>, _>>()?;
         self.import_entries(incoming)
     }
 
@@ -521,6 +773,7 @@ impl AccountManager {
         Ok(count)
     }
 
+    #[cfg(test)]
     pub fn import_codex_auth(&self) -> Result<ImportReport, String> {
         let folder = self.home.join("accounts");
         let registry = json_bytes(&read_bounded(&folder.join("registry.json"))?)?;
@@ -577,7 +830,28 @@ impl AccountManager {
         })
     }
 
+    /// Read-only compatibility preflight before requesting the desktop to close.
+    pub fn preflight_switch(&self, key: &str) -> Result<(), String> {
+        let _lock = self.operation_lock()?;
+        let store = self.load()?;
+        let target = store["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"].as_str() == Some(key))
+            .ok_or("Account no longer exists")?;
+        self.check_switch_config(&target["auth"])?;
+        let parsed = identity(&target["auth"])?;
+        let (user, workspace) = parsed
+            .key
+            .split_once("::")
+            .ok_or("Invalid account identity")?;
+        crate::desktop_state::PreparedState::prepare(&self.home, Some((user, workspace)))?;
+        Ok(())
+    }
+
     pub fn switch(&self, key: &str) -> Result<bool, String> {
+        self.require_stopped()?;
         let _lock = self.operation_lock()?;
         let mut store = self.load()?;
         let target = store["accounts"]
@@ -608,15 +882,40 @@ impl AccountManager {
     }
 
     fn activate_if_unchanged(&self, original: Option<&[u8]>, target: &Value) -> Result<(), String> {
+        self.require_stopped()?;
+        let target_identity = identity(target)?;
+        let (user, account) = target_identity
+            .key
+            .split_once("::")
+            .ok_or("Invalid target identity")?;
+        let prepared =
+            crate::desktop_state::PreparedState::prepare(&self.home, Some((user, account)))?;
+        prepared.backup(&self.directory())?;
         if read_optional_bounded(&self.auth_path())?.as_deref() != original {
             return Err("Current credentials changed during the operation. Close Codex and retry; no switch was performed.".into());
         }
         let bytes =
             serde_json::to_vec_pretty(target).map_err(|_| "Could not encode target credentials")?;
-        if original.is_some() {
-            credential_storage::atomic_write(&self.auth_path(), &bytes)?;
-        } else {
-            credential_storage::atomic_create(&self.auth_path(), &bytes)?;
+        self.require_stopped()?;
+        let changed_state = prepared.commit()?;
+        let written = (|| {
+            self.require_stopped()?;
+            if read_optional_bounded(&self.auth_path())?.as_deref() != original {
+                return Err("Current credentials changed before committing the switch; no login was replaced.".into());
+            }
+            if original.is_some() {
+                credential_storage::atomic_write(&self.auth_path(), &bytes)
+            } else {
+                credential_storage::atomic_create(&self.auth_path(), &bytes)
+            }
+        })();
+        if let Err(error) = written {
+            if changed_state && read_optional_bounded(&self.auth_path())?.as_deref() == original {
+                prepared
+                    .rollback()
+                    .map_err(|rollback| format!("{error}\n{rollback}"))?;
+            }
+            return Err(error);
         }
         if json_bytes(&read_bounded(&self.auth_path())?)? != *target {
             return Err("Credentials changed immediately after switching. State is uncertain; close other account tools and check the active account.".into());
@@ -625,6 +924,7 @@ impl AccountManager {
     }
 
     pub fn restore(&self) -> Result<(), String> {
+        self.require_stopped()?;
         let _lock = self.operation_lock()?;
         let mut store = self.load()?;
         let backup = store["backup"]["auth"].clone();
@@ -662,7 +962,10 @@ mod tests {
             ));
             fs::create_dir_all(&path).unwrap();
             Self {
-                manager: AccountManager { home: path },
+                manager: AccountManager {
+                    home: path,
+                    allow_test_clients: true,
+                },
             }
         }
         fn active(&self, auth: &Value) {
@@ -693,10 +996,125 @@ mod tests {
     }
 
     #[test]
+    fn delete_saved_account_preserves_live_login_and_other_accounts() {
+        let f = Fixture::new();
+        let first = auth("a", "personal", "one");
+        let second = auth("b", "personal", "two");
+        f.manager
+            .import_entries(vec![
+                entry(first.clone(), "A").unwrap(),
+                entry(second.clone(), "B").unwrap(),
+            ])
+            .unwrap();
+        fs::write(f.manager.auth_path(), serde_json::to_vec(&first).unwrap()).unwrap();
+        let before = fs::read(f.manager.auth_path()).unwrap();
+        f.manager
+            .remove_saved(&identity(&first).unwrap().key)
+            .unwrap();
+        assert_eq!(fs::read(f.manager.auth_path()).unwrap(), before);
+        let list = f.manager.list().unwrap();
+        assert_eq!(list.accounts.len(), 1);
+        assert_eq!(list.accounts[0].key, identity(&second).unwrap().key);
+        assert!(f.manager.remove_saved("missing").is_err());
+    }
+
+    #[test]
+    fn json_export_roundtrips_and_never_replaces_existing_files() {
+        let source = Fixture::new();
+        source
+            .manager
+            .import_entries(vec![entry(auth("a", "personal", "one"), "").unwrap()])
+            .unwrap();
+        let export = source.manager.home.join("export.json");
+        source.manager.export_json(&export).unwrap();
+        let bytes = fs::read(&export).unwrap();
+        assert!(source.manager.export_json(&export).is_err());
+        assert_eq!(fs::read(&export).unwrap(), bytes);
+        let target = Fixture::new();
+        assert_eq!(target.manager.import_file(&export).unwrap(), 1);
+        assert_eq!(target.manager.list().unwrap().accounts.len(), 1);
+        assert!(!target.manager.auth_path().exists());
+    }
+
+    #[test]
+    fn export_preserves_alias_and_uses_rotated_live_credentials_without_mutating_store() {
+        let f = Fixture::new();
+        f.manager
+            .import_entries(vec![
+                entry(auth("a", "personal", "old"), "Personal").unwrap()
+            ])
+            .unwrap();
+        let before = f.manager.load().unwrap();
+        let live = auth("a", "personal", "new");
+        fs::write(f.manager.auth_path(), serde_json::to_vec(&live).unwrap()).unwrap();
+        let path = f.manager.home.join("export.json");
+        f.manager.export_json(&path).unwrap();
+        assert_eq!(f.manager.load().unwrap(), before);
+        let target = Fixture::new();
+        target.manager.import_file(&path).unwrap();
+        let restored = target.manager.load().unwrap();
+        assert_eq!(restored["accounts"][0]["alias"], "Personal");
+        assert_eq!(restored["accounts"][0]["auth"], live);
+    }
+
+    #[test]
     fn passive_list_creates_nothing() {
         let f = Fixture::new();
         assert!(f.manager.list().unwrap().accounts.is_empty());
         assert!(!f.manager.directory().exists());
+    }
+    #[test]
+    fn quota_refresh_writeback_cannot_replace_newer_credentials_or_another_workspace() {
+        let original = auth("a", "workspace-a", "old");
+        let rotated = auth("a", "workspace-a", "rotated");
+        let key = identity(&original).unwrap().key;
+        assert!(validate_usage_writeback(&key, &original, &rotated, &original).is_ok());
+        assert!(validate_usage_writeback(
+            &key,
+            &original,
+            &rotated,
+            &auth("a", "workspace-a", "newer")
+        )
+        .is_err());
+        assert!(validate_usage_writeback(
+            &key,
+            &original,
+            &auth("a", "workspace-b", "other"),
+            &original
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn damaged_desktop_state_blocks_activation_before_credentials_are_written() {
+        let f = Fixture::new();
+        let original = serde_json::to_vec(&auth("a", "personal", "original")).unwrap();
+        fs::write(f.manager.auth_path(), &original).unwrap();
+        fs::write(f.manager.home.join(".codex-global-state.json"), b"{").unwrap();
+        assert!(f
+            .manager
+            .activate_if_unchanged(Some(&original), &auth("b", "personal", "target"))
+            .is_err());
+        assert_eq!(fs::read(f.manager.auth_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn failed_desktop_checkpoint_does_not_change_credentials_or_history() {
+        let f = Fixture::new();
+        let original = serde_json::to_vec(&auth("a", "personal", "original")).unwrap();
+        let state = br#"{"local-projects":{}}"#;
+        fs::write(f.manager.auth_path(), &original).unwrap();
+        fs::write(f.manager.home.join(".codex-global-state.json"), state).unwrap();
+        // No storage directory: checkpoint creation must fail before auth write.
+        assert!(f
+            .manager
+            .activate_if_unchanged(Some(&original), &auth("b", "personal", "target"))
+            .is_err());
+        assert_eq!(fs::read(f.manager.auth_path()).unwrap(), original);
+        assert_eq!(
+            fs::read(f.manager.home.join(".codex-global-state.json")).unwrap(),
+            state
+        );
     }
 
     #[test]

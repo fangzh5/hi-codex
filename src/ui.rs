@@ -1,11 +1,14 @@
 use crate::quota::{QuotaWindow, UsageSnapshot};
-use crate::{accounts, rpc, startup, system_usage, taskbar};
+use crate::{
+    account_usage, accounts, diagnostics, panel_layout, rpc, startup, system_usage, taskbar,
+    widget_layout,
+};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
@@ -26,8 +29,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
-    OPENFILENAMEW,
+    CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{WM_MOUSEHOVER, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext};
@@ -37,19 +40,20 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowExW, FindWindowW, GetClientRect, GetCursorPos, GetMessageW,
-    GetParent, GetWindow, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
-    TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_EXSTYLE,
-    GWL_STYLE, GW_HWNDPREV, HMENU, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IDYES, LWA_ALPHA,
-    MA_NOACTIVATE, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY,
+    DispatchMessageW, FindWindowExW, FindWindowW, GetClassNameW, GetClientRect, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
+    KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWL_EXSTYLE, GW_HWNDPREV, HMENU, HWND_TOPMOST, IDC_ARROW, IDYES, LWA_ALPHA,
+    MA_NOACTIVATE, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_YESNO, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOW, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{IDNO, MB_DEFBUTTON3, MB_YESNOCANCEL};
 
 const WIDGET_CLASS_NAME: &str = "HiCodex.TaskbarWidget";
 const FLYOUT_CLASS_NAME: &str = "HiCodex.Flyout";
@@ -61,6 +65,8 @@ const TIMER_HOVER_POLL: usize = 4;
 const TIMER_SYSTEM_USAGE: usize = 5;
 const TIMER_ACCOUNT_FEEDBACK: usize = 6;
 const TIMER_LAYOUT_SETTLE: usize = 7;
+const TIMER_LAYOUT_UPDATE: usize = 8;
+const LAYOUT_MIN_INTERVAL_MS: u32 = 50;
 const ACCOUNT_FEEDBACK_MS: u32 = 8_000;
 const POSITION_INTERVAL_MS: u32 = 2_000;
 const SYSTEM_USAGE_INTERVAL_MS: u32 = 2_000;
@@ -73,7 +79,10 @@ const HOVER_HIDE_TICKS: u32 = 3;
 const WM_REFRESHED: u32 = WM_APP + 1;
 const WM_ACCOUNT_DONE: u32 = WM_APP + 2;
 const WM_TASKBAR_LAYOUT: u32 = WM_APP + 3;
+const WM_MULTI_UPDATED: u32 = WM_APP + 4;
 
+const MENU_LANGUAGE_EN: i32 = 1018;
+const MENU_LANGUAGE_ZH: i32 = 1019;
 const MENU_REFRESH: i32 = 1001;
 const MENU_OPEN_USAGE: i32 = 1002;
 const MENU_STARTUP: i32 = 1003;
@@ -81,12 +90,16 @@ const MENU_CENTER_TASKBAR: i32 = 1004;
 const MENU_ACRYLIC_TASKBAR: i32 = 1005;
 const MENU_EXIT: i32 = 1006;
 const MENU_SYSTEM_USAGE: i32 = 1007;
+const MENU_ABOUT: i32 = 1008;
 const MENU_SAVE_ACCOUNT: i32 = 1010;
 const MENU_IMPORT_ACCOUNT: i32 = 1011;
-const MENU_IMPORT_CODEX_AUTH: i32 = 1012;
+const MENU_EXPORT_ACCOUNT: i32 = 1012;
+const MENU_DELETE_FIRST: i32 = 3000;
 const MENU_RESTORE_ACCOUNT: i32 = 1013;
 const MENU_SIGN_IN_ACCOUNT: i32 = 1014;
 const MENU_CANCEL_SIGN_IN: i32 = 1015;
+const MENU_REPAIR_HISTORY: i32 = 1016;
+const MENU_ACCOUNT_STORAGE_ERROR: i32 = 1017;
 const MENU_ACCOUNT_FIRST: i32 = 2000;
 
 static STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
@@ -108,9 +121,48 @@ static HOVER_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CENTERED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_ACRYLIC: AtomicBool = AtomicBool::new(false);
 static SYSTEM_USAGE_ENABLED: AtomicBool = AtomicBool::new(false);
-static ACCOUNT_VISIBLE: AtomicBool = AtomicBool::new(false);
+static SWITCH_MODE: AtomicBool = AtomicBool::new(false);
+static ACCOUNT_VISIBLE: AtomicBool = AtomicBool::new(true);
 static ACCOUNT_BUTTON_PRESSED: AtomicBool = AtomicBool::new(false);
+static MULTI_REFRESHING: AtomicBool = AtomicBool::new(false);
+static MULTI_GENERATION: AtomicU64 = AtomicU64::new(0);
+static MULTI_LAST_REFRESH: Mutex<Option<Instant>> = Mutex::new(None);
+static ACCOUNT_SCROLL: AtomicUsize = AtomicUsize::new(0);
+static PANEL_ROWS: AtomicUsize = AtomicUsize::new(0);
+static ACCOUNT_STORAGE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static SYSTEM_USAGE_SAMPLER: OnceLock<Mutex<system_usage::SystemUsageSampler>> = OnceLock::new();
+static LAYOUT_GATE: Mutex<LayoutGate> = Mutex::new(LayoutGate {
+    last_finished: None,
+    active: false,
+});
+
+struct LayoutGate {
+    last_finished: Option<Instant>,
+    active: bool,
+}
+
+impl LayoutGate {
+    fn begin(&mut self, now: Instant) -> u32 {
+        let interval = Duration::from_millis(LAYOUT_MIN_INTERVAL_MS as u64);
+        let remaining = if self.active {
+            interval
+        } else {
+            self.last_finished.map_or(Duration::ZERO, |last| {
+                interval.saturating_sub(now.saturating_duration_since(last))
+            })
+        };
+        let delay = remaining.as_nanos().div_ceil(1_000_000) as u32;
+        if delay == 0 {
+            self.active = true;
+        }
+        delay
+    }
+
+    fn finish(&mut self, now: Instant) {
+        self.last_finished = Some(now);
+        self.active = false;
+    }
+}
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -127,6 +179,8 @@ struct AppState {
     updated_at: Option<i64>,
     system_usage: system_usage::SystemUsage,
     account_feedback: Option<String>,
+    saved_accounts: Vec<account_usage::Row>,
+    saved_accounts_error: Option<String>,
 }
 
 impl Default for AppState {
@@ -138,6 +192,8 @@ impl Default for AppState {
             updated_at: None,
             system_usage: system_usage::SystemUsage::default(),
             account_feedback: None,
+            saved_accounts: Vec::new(),
+            saved_accounts_error: None,
         }
     }
 }
@@ -199,18 +255,134 @@ fn trigger_refresh() {
     });
 }
 
+fn notify_multi_update() {
+    let hwnd = WINDOW.load(Ordering::Acquire);
+    if hwnd != 0 {
+        unsafe {
+            PostMessageW(hwnd, WM_MULTI_UPDATED, 0, 0);
+        }
+    }
+}
+
+fn trigger_saved_refresh(force: bool) {
+    if ACCOUNT_OPERATION.load(Ordering::Acquire) {
+        return;
+    }
+    if let Ok(last) = MULTI_LAST_REFRESH.lock() {
+        if !force && last.is_some_and(|time| time.elapsed() < Duration::from_secs(300)) {
+            return;
+        }
+    }
+    if MULTI_REFRESHING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Ok(mut last) = MULTI_LAST_REFRESH.lock() {
+        *last = Some(Instant::now());
+    }
+    let generation = MULTI_GENERATION.load(Ordering::Acquire);
+    std::thread::spawn(move || {
+        let run = || -> Result<(), String> {
+            // Account management cancels our pending RPC before waiting for this
+            // gate, so its switch cannot race our child or rotated-token save.
+            let _gate = AUTH_GATE
+                .lock()
+                .map_err(|_| "Account refresh unavailable")?;
+            if ACCOUNT_OPERATION.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let manager = accounts::AccountManager::current()?;
+            let list = manager.list()?;
+            let keys: Vec<_> = list
+                .accounts
+                .iter()
+                .filter(|account| list.active_key.as_deref() != Some(&account.key))
+                .map(|account| account.key.clone())
+                .collect();
+            if let Some(mut state) = STATE.get().and_then(|state| state.lock().ok()) {
+                if MULTI_GENERATION.load(Ordering::Acquire) == generation {
+                    account_usage::reconcile(&mut state.saved_accounts, list);
+                    state.saved_accounts_error = None;
+                }
+            }
+            notify_multi_update();
+            for key in keys {
+                if ACCOUNT_OPERATION.load(Ordering::Acquire)
+                    || MULTI_GENERATION.load(Ordering::Acquire) != generation
+                {
+                    break;
+                }
+                if let Some(mut state) = STATE.get().and_then(|state| state.lock().ok()) {
+                    if let Some(row) = state
+                        .saved_accounts
+                        .iter_mut()
+                        .find(|row| row.account.key == key)
+                    {
+                        row.refreshing = true;
+                    }
+                }
+                notify_multi_update();
+                let result = manager.fetch_saved_usage(&key, &ACCOUNT_OPERATION);
+                if MULTI_GENERATION.load(Ordering::Acquire) != generation {
+                    break;
+                }
+                if let Some(mut state) = STATE.get().and_then(|state| state.lock().ok()) {
+                    if let Some(row) = state
+                        .saved_accounts
+                        .iter_mut()
+                        .find(|row| row.account.key == key)
+                    {
+                        row.refreshing = false;
+                        match result {
+                            Ok(result) => {
+                                row.usage = Some(result.usage);
+                                row.updated_at = Some(now_unix());
+                                row.error = None;
+                            }
+                            Err(error) => {
+                                row.error = Some(error);
+                            }
+                        }
+                    }
+                }
+                notify_multi_update();
+            }
+            Ok(())
+        };
+        if let Err(error) = run() {
+            if let Some(mut state) = STATE.get().and_then(|state| state.lock().ok()) {
+                if MULTI_GENERATION.load(Ordering::Acquire) == generation {
+                    state.saved_accounts_error = Some(error);
+                }
+            }
+        }
+        if let Some(mut state) = STATE.get().and_then(|state| state.lock().ok()) {
+            for row in &mut state.saved_accounts {
+                row.refreshing = false;
+            }
+        }
+        MULTI_REFRESHING.store(false, Ordering::Release);
+        notify_multi_update();
+    });
+}
+
 enum AccountAction {
     Save,
     SignIn,
     Import(std::path::PathBuf),
-    ImportCodexAuth,
+    Export(std::path::PathBuf),
+    Delete(String),
     Switch(String),
     Restore,
+    RepairHistory,
 }
 
 fn begin_account_action(action: AccountAction) {
     if ACCOUNT_OPERATION.swap(true, Ordering::AcqRel) {
         return;
+    }
+    MULTI_GENERATION.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut last) = MULTI_LAST_REFRESH.lock() {
+        *last = None;
     }
     ACCOUNT_LOGIN_REQUIRED.store(false, Ordering::Release);
     let signing_in = matches!(&action, AccountAction::SignIn);
@@ -264,31 +436,68 @@ fn begin_account_action(action: AccountAction) {
                     let count = manager.import_file(&path)?;
                     Ok((format!("Added {count}. Current account unchanged."), false))
                 }
-                AccountAction::ImportCodexAuth => {
-                    let report = manager.import_codex_auth()?;
-                    Ok((
-                        format!(
-                            "Added {}; skipped {}. Current account unchanged.",
-                            report.added, report.skipped
-                        ),
-                        false,
-                    ))
+                AccountAction::Export(path) => {
+                    manager.export_json(&path)?;
+                    Ok(("Accounts exported.".into(), false))
+                }
+                AccountAction::Delete(key) => {
+                    manager.remove_saved(&key)?;
+                    Ok(("Saved account removed.".into(), false))
                 }
                 AccountAction::Switch(key) => {
-                    let changed = manager.switch(&key)?;
-                    Ok((
-                        if changed {
-                            "Account selected. Reopen Codex."
-                        } else {
-                            "This account is already selected."
-                        }
-                        .to_owned(),
-                        changed,
-                    ))
+                    let list = manager.list()?;
+                    if list.active_key.as_deref() == Some(&key) {
+                        return Ok(("Already selected.".into(), false));
+                    }
+                    if !list.accounts.iter().any(|a| a.key == key) {
+                        return Err("Saved account no longer exists".into());
+                    }
+                    manager.preflight_switch(&key)?;
+                    let desktop = crate::desktop_handoff::Desktop::discover()?;
+                    let changed = crate::desktop_handoff::sequence(
+                        || {
+                            desktop.close(|| unsafe {
+                            let message=wide("Codex is still running. Force close may interrupt tasks and lose unsaved work.\n\nYes: Force close Codex Desktop\nNo: Wait another 15 seconds\nCancel: Stop switching");
+                            match MessageBoxW(WINDOW.load(Ordering::Acquire),message.as_ptr(),wide("Codex is still running").as_ptr(),MB_YESNOCANCEL | MB_DEFBUTTON3 | MB_ICONWARNING) {
+                                IDYES => crate::desktop_handoff::CloseChoice::Force,
+                                IDNO => crate::desktop_handoff::CloseChoice::Wait,
+                                _ => crate::desktop_handoff::CloseChoice::Cancel,
+                            }
+                        })
+                        },
+                        || manager.switch(&key),
+                        || {
+                            if manager.list()?.active_key.as_deref() == Some(&key) {
+                                Ok(())
+                            } else {
+                                Err("Switched account could not be verified. Codex was not reopened.".into())
+                            }
+                        },
+                        || desktop.open(),
+                        |stage| {
+                            if let Some(mut state) = STATE.get().and_then(|s| s.lock().ok()) {
+                                state.account_feedback = Some(stage.into());
+                            }
+                            notify_multi_update();
+                        },
+                    )?;
+                    Ok(("Codex reopened.".into(), changed))
                 }
                 AccountAction::Restore => {
                     manager.restore()?;
                     Ok(("Account restored. Reopen Codex.".to_owned(), true))
+                }
+                AccountAction::RepairHistory => {
+                    let changed = manager.repair_local_history()?;
+                    Ok((
+                        if changed {
+                            "Local project navigation repaired. Reopen Codex."
+                        } else {
+                            "Local project navigation is already consistent."
+                        }
+                        .to_owned(),
+                        false,
+                    ))
                 }
             }
         })();
@@ -319,7 +528,7 @@ fn begin_account_action(action: AccountAction) {
 
 unsafe fn confirm_switch(hwnd: HWND, target: &str) -> bool {
     let message = format!(
-        "Switch to {target}?\n\nClose Codex and other switchers first.\nReopen Codex afterward."
+        "Switch to {target}?\n\nFully quit ChatGPT/Codex and close CLI/IDE sessions first.\nLocal project navigation will be backed up and kept across saved accounts. Cloud conversations remain account-specific.\nReopen Codex afterward."
     );
     MessageBoxW(
         hwnd,
@@ -366,6 +575,30 @@ unsafe fn select_auth_file(hwnd: HWND) -> Option<std::path::PathBuf> {
     }
 }
 
+unsafe fn select_export_file(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut buffer = [0u16; 32768];
+    let name = wide("hicodex-accounts.json");
+    buffer[..name.len()].copy_from_slice(&name);
+    let filter = wide("JSON files\0*.json\0\0");
+    let title = wide("Export credentials — choose a new private file");
+    let extension = wide("json");
+    let mut dialog: OPENFILENAMEW = zeroed();
+    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = hwnd;
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.lpstrDefExt = extension.as_ptr();
+    dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if GetSaveFileNameW(&mut dialog) == 0 {
+        return None;
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let length = buffer.iter().position(|v| *v == 0)?;
+    Some(std::ffi::OsString::from_wide(&buffer[..length]).into())
+}
+
 unsafe fn append_account_menu(menu: HMENU) -> Vec<accounts::Account> {
     let submenu = CreatePopupMenu();
     if submenu == 0 {
@@ -376,46 +609,60 @@ unsafe fn append_account_menu(menu: HMENU) -> Vec<accounts::Account> {
     AppendMenuW(
         submenu,
         flags,
-        MENU_SAVE_ACCOUNT as usize,
-        wide("Save current account").as_ptr(),
-    );
-    AppendMenuW(
-        submenu,
-        flags,
         MENU_SIGN_IN_ACCOUNT as usize,
-        wide("Sign in and save account...").as_ptr(),
+        wide(crate::locale::text("Sign in...")).as_ptr(),
     );
     if ACCOUNT_LOGIN_ACTIVE.load(Ordering::Acquire) {
         AppendMenuW(
             submenu,
             MF_STRING,
             MENU_CANCEL_SIGN_IN as usize,
-            wide("Cancel account sign-in").as_ptr(),
+            wide(crate::locale::text("Cancel sign-in")).as_ptr(),
         );
     }
     AppendMenuW(
         submenu,
         flags,
         MENU_IMPORT_ACCOUNT as usize,
-        wide("Import auth JSON...").as_ptr(),
+        wide(crate::locale::text("Import JSON...")).as_ptr(),
     );
     AppendMenuW(
         submenu,
         flags,
-        MENU_IMPORT_CODEX_AUTH as usize,
-        wide("Import existing codex-auth accounts").as_ptr(),
+        MENU_EXPORT_ACCOUNT as usize,
+        wide(crate::locale::text("Export JSON...")).as_ptr(),
     );
-    AppendMenuW(submenu, MF_SEPARATOR, 0, null());
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        submenu as usize,
+        wide(crate::locale::text("Accounts")).as_ptr(),
+    );
     let result = accounts::AccountManager::current().and_then(|manager| manager.list());
     let accounts = match result {
         Ok(list) => {
-            for (index, account) in list.accounts.iter().enumerate() {
-                let active = list.active_key.as_deref() == Some(&account.key);
+            AppendMenuW(submenu, MF_SEPARATOR, 0, null());
+            let delete_menu = CreatePopupMenu();
+            if delete_menu != 0 {
+                for (index, account) in list.accounts.iter().enumerate() {
+                    AppendMenuW(
+                        delete_menu,
+                        flags,
+                        MENU_DELETE_FIRST as usize + index,
+                        wide(&account.label(ACCOUNT_VISIBLE.load(Ordering::Acquire), index))
+                            .as_ptr(),
+                    );
+                }
                 AppendMenuW(
                     submenu,
-                    flags | if active { MF_CHECKED | MF_GRAYED } else { 0 },
-                    MENU_ACCOUNT_FIRST as usize + index,
-                    wide(&account.label(ACCOUNT_VISIBLE.load(Ordering::Acquire), index)).as_ptr(),
+                    MF_POPUP
+                        | if list.accounts.is_empty() {
+                            MF_GRAYED
+                        } else {
+                            0
+                        },
+                    delete_menu as usize,
+                    wide(crate::locale::text("Remove account")).as_ptr(),
                 );
             }
             if list.accounts.is_empty() {
@@ -423,35 +670,25 @@ unsafe fn append_account_menu(menu: HMENU) -> Vec<accounts::Account> {
                     submenu,
                     MF_STRING | MF_GRAYED,
                     0,
-                    wide("No saved accounts").as_ptr(),
+                    wide(crate::locale::text("No saved accounts")).as_ptr(),
                 );
             }
-            AppendMenuW(submenu, MF_SEPARATOR, 0, null());
-            AppendMenuW(
-                submenu,
-                MF_STRING
-                    | if busy || !list.can_restore {
-                        MF_GRAYED
-                    } else {
-                        0
-                    },
-                MENU_RESTORE_ACCOUNT as usize,
-                wide("Restore last switch backup").as_ptr(),
-            );
             list.accounts
         }
-        Err(_) => {
+        Err(error) => {
             // Account storage failure must never change quota status.
+            if let Ok(mut notice) = ACCOUNT_STORAGE_ERROR.lock() {
+                *notice = Some(error);
+            }
             AppendMenuW(
                 submenu,
-                MF_STRING | MF_GRAYED,
-                0,
-                wide("Account storage unavailable").as_ptr(),
+                MF_STRING,
+                MENU_ACCOUNT_STORAGE_ERROR as usize,
+                wide(crate::locale::text("Storage error...")).as_ptr(),
             );
             Vec::new()
         }
     };
-    AppendMenuW(menu, MF_POPUP, submenu as usize, wide("Accounts").as_ptr());
     accounts
 }
 
@@ -520,9 +757,15 @@ unsafe fn create_font_with_quality(
     logical_pixels: i32,
     weight: u32,
     quality: u32,
+    explicit_semibold: bool,
 ) -> HFONT {
     let height = -((logical_pixels * dpi as i32) / 96).max(logical_pixels);
-    let face = wide("Segoe UI");
+    // Name the installed face explicitly to avoid inconsistent GDI weight matching.
+    let face = wide(if explicit_semibold && weight == FW_SEMIBOLD {
+        "Segoe UI Semibold"
+    } else {
+        "Segoe UI"
+    });
     CreateFontW(
         height,
         0,
@@ -542,11 +785,17 @@ unsafe fn create_font_with_quality(
 }
 
 unsafe fn create_font(dpi: u32, logical_pixels: i32, weight: u32) -> HFONT {
-    create_font_with_quality(dpi, logical_pixels, weight, CLEARTYPE_NATURAL_QUALITY)
+    create_font_with_quality(dpi, logical_pixels, weight, CLEARTYPE_NATURAL_QUALITY, true)
 }
 
 unsafe fn create_widget_font(dpi: u32, logical_pixels: i32, weight: u32) -> HFONT {
-    create_font_with_quality(dpi, logical_pixels, weight, ANTIALIASED_QUALITY.into())
+    create_font_with_quality(
+        dpi,
+        logical_pixels,
+        weight,
+        ANTIALIASED_QUALITY.into(),
+        false,
+    )
 }
 
 unsafe fn paint_text(dc: HDC, font: HFONT, color: u32, text: &str, rect: &mut RECT, flags: u32) {
@@ -919,7 +1168,7 @@ unsafe fn render_widget_layered(hwnd: HWND) {
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    UpdateLayeredWindow(
+    let rendered = UpdateLayeredWindow(
         hwnd,
         screen_dc,
         null(),
@@ -929,6 +1178,11 @@ unsafe fn render_widget_layered(hwnd: HWND) {
         0,
         &blend,
         ULW_ALPHA,
+    );
+
+    diagnostics::record(
+        diagnostics::Event::Render,
+        if rendered == 0 { GetLastError() } else { 0 },
     );
 
     SelectObject(output_dc, old_output_bitmap);
@@ -1005,14 +1259,11 @@ unsafe fn position_widget(hwnd: HWND) {
         return;
     }
 
-    if GetParent(hwnd) != tray {
-        SetParent(hwnd, tray);
-        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD | WS_VISIBLE) as isize);
-        SetWindowLongPtrW(
-            hwnd,
-            GWL_EXSTYLE,
-            (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) as isize,
-        );
+    // Never parent/own this window across processes: Windows would attach our
+    // input queue to Explorer, defeating SendMessageTimeout's timeout.
+    if IsWindowVisible(tray) == 0 {
+        ShowWindow(hwnd, SW_HIDE);
+        return;
     }
 
     let mut tray_rect: RECT = zeroed();
@@ -1020,43 +1271,63 @@ unsafe fn position_widget(hwnd: HWND) {
         return;
     }
 
-    let dpi = GetDpiForWindow(tray).max(96) as i32;
-    let width = widget_width(tray, dpi as u32);
-    let tray_height = tray_rect.bottom - tray_rect.top;
-    let height = (42 * dpi / 96).min(tray_height.saturating_sub(2)).max(28);
-    let y = ((tray_height - height) / 2).max(0);
-
-    let notify_class = wide("TrayNotifyWnd");
-    let notify = FindWindowExW(tray, 0, notify_class.as_ptr(), null());
-    let x = if notify != 0 {
-        let mut notify_rect: RECT = zeroed();
-        if GetWindowRect(notify, &mut notify_rect) != 0 {
-            notify_rect.left - tray_rect.left - width - (2 * dpi / 96)
-        } else {
-            tray_rect.right - tray_rect.left - width - (220 * dpi / 96)
-        }
-    } else {
-        tray_rect.right - tray_rect.left - width - (220 * dpi / 96)
+    // A standalone overlay must follow auto-hide and fullscreen behavior itself.
+    let monitor = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = zeroed();
+    info.cbSize = size_of::<MONITORINFO>() as u32;
+    let foreground = GetForegroundWindow();
+    let mut front_rect: RECT = zeroed();
+    let mut class = [0u16; 64];
+    let length = GetClassNameW(foreground, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+    let desktop = matches!(
+        String::from_utf16_lossy(&class[..length]).as_str(),
+        "Progman" | "WorkerW"
+    );
+    let has_monitor = GetMonitorInfoW(monitor, &mut info) != 0;
+    let covered = has_monitor
+        && foreground != hwnd
+        && foreground != tray
+        && !desktop
+        && GetWindowRect(foreground, &mut front_rect) != 0
+        && widget_layout::covered_by_fullscreen(info.rcMonitor, front_rect);
+    if covered || (has_monitor && widget_layout::offscreen(tray_rect, info.rcMonitor)) {
+        ShowWindow(hwnd, SW_HIDE);
+        return;
     }
-    .max(0);
 
+    let dpi = GetDpiForWindow(tray).max(96);
+    let width = widget_width(tray, dpi);
+    let notify = FindWindowExW(tray, 0, wide("TrayNotifyWnd").as_ptr(), null());
+    let mut notify_rect: RECT = zeroed();
+    let notify_left =
+        (notify != 0 && GetWindowRect(notify, &mut notify_rect) != 0).then_some(notify_rect.left);
+    let Some(target) = widget_layout::position(tray_rect, notify_left, dpi, width) else {
+        ShowWindow(hwnd, SW_HIDE);
+        return;
+    };
+    let height = target.bottom - target.top;
     let mut current: RECT = zeroed();
     if GetWindowRect(hwnd, &mut current) == 0
-        || current.left != tray_rect.left + x
-        || current.top != tray_rect.top + y
+        || current.left != target.left
+        || current.top != target.top
         || current.right - current.left != width
         || current.bottom - current.top != height
         || IsWindowVisible(hwnd) == 0
+        || GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST as isize == 0
         || GetWindow(hwnd, GW_HWNDPREV) != 0
     {
-        SetWindowPos(
+        let positioned = SetWindowPos(
             hwnd,
-            HWND_TOP,
-            x,
-            y,
+            HWND_TOPMOST,
+            target.left,
+            target.top,
             width,
             height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        diagnostics::record(
+            diagnostics::Event::Position,
+            if positioned == 0 { GetLastError() } else { 0 },
         );
     }
 
@@ -1071,8 +1342,43 @@ unsafe fn update_taskbar_centering(hwnd: HWND) {
         taskbar::watch_layout(hwnd, WM_TASKBAR_LAYOUT);
         taskbar::apply_centered();
     } else {
+        KillTimer(hwnd, TIMER_LAYOUT_UPDATE);
+        KillTimer(hwnd, TIMER_LAYOUT_SETTLE);
         taskbar::stop_layout_watch();
         taskbar::restore_left();
+    }
+}
+
+unsafe fn refresh_taskbar_layout(hwnd: HWND, settle: bool) {
+    KillTimer(hwnd, TIMER_LAYOUT_UPDATE);
+    if !TASKBAR_CENTERED.load(Ordering::Acquire) {
+        taskbar::acknowledge_layout_change();
+        return;
+    }
+    let Ok(mut gate) = LAYOUT_GATE.lock() else {
+        taskbar::acknowledge_layout_change();
+        return;
+    };
+    let delay = gate.begin(Instant::now());
+    drop(gate);
+    if delay != 0 {
+        // Keep the event watcher queued until this timer runs. A sustained
+        // Explorer event stream must not refill the UI queue between passes.
+        if SetTimer(hwnd, TIMER_LAYOUT_UPDATE, delay, None) == 0 {
+            taskbar::acknowledge_layout_change();
+        }
+        return;
+    }
+    taskbar::acknowledge_layout_change();
+    position_widget(hwnd);
+    update_taskbar_centering(hwnd);
+    if let Ok(mut gate) = LAYOUT_GATE.lock() {
+        gate.finish(Instant::now());
+    }
+    if settle && TASKBAR_CENTERED.load(Ordering::Acquire) {
+        // One trailing pass catches delayed MSAA button geometry. This is
+        // event-driven; idle operation keeps only the two-second recovery pass.
+        SetTimer(hwnd, TIMER_LAYOUT_SETTLE, 120, None);
     }
 }
 
@@ -1175,7 +1481,355 @@ unsafe fn draw_progress(
     }
 }
 
+fn multi_panel() -> bool {
+    STATE
+        .get()
+        .and_then(|state| state.lock().ok())
+        .is_some_and(|state| {
+            !state.saved_accounts.is_empty() || state.saved_accounts_error.is_some()
+        })
+}
+
 unsafe fn draw_flyout(hwnd: HWND) {
+    if !multi_panel() {
+        draw_legacy_flyout(hwnd);
+        return;
+    }
+    let snapshot = STATE
+        .get()
+        .and_then(|state| state.lock().ok())
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    let mut paint: PAINTSTRUCT = zeroed();
+    let dc = BeginPaint(hwnd, &mut paint);
+    if dc == 0 {
+        return;
+    }
+    let mut bounds: RECT = zeroed();
+    GetClientRect(hwnd, &mut bounds);
+    paint_account_panel(dc, bounds, &snapshot, GetDpiForWindow(hwnd).max(96));
+    EndPaint(hwnd, &paint);
+}
+
+// The bundled toolbar SVGs use only absolute M/L/C commands, with spaced tokens.
+// Read the same SVG paths used by the HTML preview, preserving DPI-scaled vectors.
+unsafe fn paint_toolbar_svg(dc: HDC, svg: &str, x: i32, y: i32, dpi: u32, color: u32) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BeginPath, EndPath, LineTo, MoveToEx, PolyBezierTo, StrokePath,
+    };
+    let scale = dpi as f32 / 96.0;
+    let pen = CreatePen(
+        PS_SOLID,
+        (1.8 * 18.0 / 24.0 * scale).round().max(1.0) as i32,
+        color,
+    );
+    let old = SelectObject(dc, pen);
+    for path in svg.split("d=\"").skip(1) {
+        let mut tokens = path.split('"').next().unwrap_or("").split_whitespace();
+        BeginPath(dc);
+        while let Some(command) = tokens.next() {
+            let count = if command == "C" { 3 } else { 1 };
+            let mut points = [POINT { x: 0, y: 0 }; 3];
+            for point in points.iter_mut().take(count) {
+                let px = tokens
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let py = tokens
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                point.x = ((x as f32 + px * 18.0 / 24.0) * scale).round() as i32;
+                point.y = ((y as f32 + py * 18.0 / 24.0) * scale).round() as i32;
+            }
+            match command {
+                "M" => {
+                    MoveToEx(dc, points[0].x, points[0].y, null_mut());
+                }
+                "L" => {
+                    LineTo(dc, points[0].x, points[0].y);
+                }
+                "C" => {
+                    PolyBezierTo(dc, points.as_ptr(), 3);
+                }
+                _ => break,
+            }
+        }
+        EndPath(dc);
+        StrokePath(dc);
+    }
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
+
+unsafe fn paint_account_panel(dc: HDC, bounds: RECT, snapshot: &AppState, dpi: u32) {
+    let bg = CreateSolidBrush(rgb(32, 36, 44));
+    FillRect(dc, &bounds, bg);
+    DeleteObject(bg);
+    SetBkMode(dc, TRANSPARENT as i32);
+    let scale = |v: i32| v * dpi as i32 / 96;
+    let width = bounds.right * 96 / dpi as i32;
+    let height = bounds.bottom * 96 / dpi as i32;
+    let title = create_font(dpi, 18, FW_SEMIBOLD);
+    let body = create_font(dpi, 15, FW_SEMIBOLD);
+    let small = create_font(dpi, 13, FW_SEMIBOLD);
+    let number = create_font(dpi, 19, FW_SEMIBOLD);
+    let fg = rgb(231, 234, 240);
+    let muted = rgb(169, 179, 195);
+    let text =
+        |font: HFONT, color: u32, value: &str, x: i32, y: i32, w: i32, h: i32, right: bool| {
+            let mut r = RECT {
+                left: scale(x),
+                top: scale(y),
+                right: scale(x + w),
+                bottom: scale(y + h),
+            };
+            paint_text(
+                dc,
+                font,
+                color,
+                value,
+                &mut r,
+                DT_VCENTER
+                    | DT_SINGLELINE
+                    | DT_NOPREFIX
+                    | DT_END_ELLIPSIS
+                    | if right { DT_RIGHT } else { DT_LEFT },
+            );
+        };
+    text(title, fg, "HiCodex", 20, 12, 180, 28, false);
+    text(
+        small,
+        muted,
+        crate::locale::text("Accounts"),
+        20,
+        46,
+        220,
+        20,
+        false,
+    );
+    text(
+        small,
+        muted,
+        crate::locale::text("Week"),
+        width - 176,
+        46,
+        70,
+        20,
+        true,
+    );
+    text(
+        small,
+        muted,
+        crate::locale::text("5 hours"),
+        width - 90,
+        46,
+        70,
+        20,
+        true,
+    );
+    let count = snapshot.saved_accounts.len();
+    let visible_rows = PANEL_ROWS.load(Ordering::Acquire).min(count);
+    let offset =
+        panel_layout::scroll_offset(ACCOUNT_SCROLL.load(Ordering::Acquire), count, visible_rows);
+    for (index, row) in snapshot
+        .saved_accounts
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_rows)
+    {
+        let y = panel_layout::ROW_TOP + (index - offset) as i32 * panel_layout::ROW_HEIGHT;
+        if row.active {
+            rounded_bar(
+                dc,
+                RECT {
+                    left: scale(12),
+                    top: scale(y),
+                    right: scale(width - 12),
+                    bottom: scale(y + panel_layout::ROW_HEIGHT - 2),
+                },
+                rgb(43, 51, 61),
+                scale(7),
+            );
+        }
+        let label = if ACCOUNT_VISIBLE.load(Ordering::Acquire) {
+            if row.account.alias.is_empty() {
+                row.account.email.clone()
+            } else {
+                row.account.alias.clone()
+            }
+        } else {
+            format!("Account {}", index + 1)
+        };
+        text(
+            body,
+            if row.active { rgb(164, 223, 187) } else { fg },
+            &label,
+            20,
+            y + 6,
+            width - 210,
+            23,
+            false,
+        );
+        let usage = if row.active {
+            Some(&snapshot.usage)
+        } else {
+            row.usage.as_ref()
+        };
+        let failed =
+            row.error.is_some() || (row.active && matches!(snapshot.status, Status::Error(_)));
+        let status = if failed {
+            crate::locale::text("Failed").to_owned()
+        } else if row.refreshing {
+            crate::locale::text("Refreshing...").to_owned()
+        } else {
+            let updated = if row.active {
+                snapshot.updated_at
+            } else {
+                row.updated_at
+            };
+            match updated {
+                Some(at) if now_unix().saturating_sub(at) < 60 => {
+                    crate::locale::text("Just now").into()
+                }
+                Some(at) => format!("{}m ago", now_unix().saturating_sub(at) / 60),
+                None => "-".into(),
+            }
+        };
+        let credits = usage
+            .and_then(|u| u.reset_credits)
+            .map(|n| format!("Reset x{n}"))
+            .unwrap_or_else(|| "Reset -".into());
+        text(small, muted, &credits, 20, y + 32, 68, 20, false);
+        text(small, muted, &status, 96, y + 32, width - 286, 20, false);
+        for (x, window) in [
+            (width - 176, usage.and_then(|u| u.weekly.as_ref())),
+            (width - 90, usage.and_then(|u| u.five_hour.as_ref())),
+        ] {
+            let value = window
+                .map(|q| format!("{}%", q.remaining_percent()))
+                .unwrap_or_else(|| "-".into());
+            text(
+                number,
+                if failed { muted } else { color_for(window) },
+                &value,
+                x,
+                y + 5,
+                70,
+                25,
+                true,
+            );
+            let reset = if window.is_some() {
+                quota_reset_compact(window)
+            } else {
+                "-".into()
+            };
+            text(small, muted, &reset, x, y + 32, 70, 20, true);
+        }
+    }
+    if count == 0 {
+        text(
+            small,
+            muted,
+            crate::locale::text("No saved accounts"),
+            20,
+            76,
+            width - 40,
+            22,
+            false,
+        );
+    }
+    let footer = height - 44;
+    let line = CreateSolidBrush(rgb(53, 59, 69));
+    FillRect(
+        dc,
+        &RECT {
+            left: scale(20),
+            top: scale(footer),
+            right: scale(width - 20),
+            bottom: scale(footer + 1),
+        },
+        line,
+    );
+    DeleteObject(line);
+    let switching = SWITCH_MODE.load(Ordering::Acquire);
+    let switch_color = if switching { rgb(164, 223, 187) } else { muted };
+    paint_toolbar_svg(
+        dc,
+        include_str!("../assets/icons/toolbar-switch.svg"),
+        20,
+        footer + 13,
+        dpi,
+        switch_color,
+    );
+    text(
+        body,
+        switch_color,
+        snapshot
+            .account_feedback
+            .as_deref()
+            .unwrap_or_else(|| crate::locale::text(if switching { "Cancel" } else { "Switch" })),
+        44,
+        footer + 8,
+        90,
+        28,
+        false,
+    );
+    let visible = ACCOUNT_VISIBLE.load(Ordering::Acquire);
+    paint_toolbar_svg(
+        dc,
+        if visible {
+            include_str!("../assets/icons/toolbar-visibility.svg")
+        } else {
+            include_str!("../assets/icons/toolbar-visibility-off.svg")
+        },
+        146,
+        footer + 13,
+        dpi,
+        muted,
+    );
+    text(
+        body,
+        muted,
+        crate::locale::text(if visible { "Hide" } else { "Show" }),
+        170,
+        footer + 8,
+        62,
+        28,
+        false,
+    );
+    let refresh_label = crate::locale::text(if MULTI_REFRESHING.load(Ordering::Acquire) {
+        "Refreshing..."
+    } else {
+        "Refresh"
+    });
+    let refresh_width = (text_width(dc, body, refresh_label) * 96 + dpi as i32 - 1) / dpi as i32;
+    paint_toolbar_svg(
+        dc,
+        include_str!("../assets/icons/toolbar-refresh.svg"),
+        width - 20 - refresh_width - 24,
+        footer + 13,
+        dpi,
+        muted,
+    );
+    text(
+        body,
+        muted,
+        refresh_label,
+        width - 20 - refresh_width,
+        footer + 8,
+        refresh_width,
+        28,
+        true,
+    );
+
+    for font in [title, body, small, number] {
+        DeleteObject(font);
+    }
+}
+
+unsafe fn draw_legacy_flyout(hwnd: HWND) {
     let mut paint: PAINTSTRUCT = zeroed();
     let dc = BeginPaint(hwnd, &mut paint);
     if dc == 0 {
@@ -1545,12 +2199,14 @@ unsafe fn position_flyout(widget: HWND, flyout: HWND) {
     }
 
     let dpi = GetDpiForWindow(widget).max(96) as i32;
-    let mut width = 320 * dpi / 96;
-    if ACCOUNT_VISIBLE.load(Ordering::Acquire)
-        || STATE
-            .get()
-            .and_then(|state| state.lock().ok())
-            .is_some_and(|state| state.account_feedback.is_some())
+    let multi = multi_panel();
+    let mut width = if multi { panel_layout::WIDTH } else { 320 } * dpi / 96;
+    if !multi
+        && (ACCOUNT_VISIBLE.load(Ordering::Acquire)
+            || STATE
+                .get()
+                .and_then(|state| state.lock().ok())
+                .is_some_and(|state| state.account_feedback.is_some()))
     {
         if let Some(state) = STATE.get().and_then(|state| state.lock().ok()) {
             let account_text = format!(
@@ -1570,7 +2226,7 @@ unsafe fn position_flyout(widget: HWND, flyout: HWND) {
             ReleaseDC(widget, dc);
         }
     }
-    let height = 214 * dpi / 96;
+    let mut height = 214 * dpi / 96;
     let gap = (9 * dpi / 96).max(6);
 
     let monitor = MonitorFromWindow(widget, MONITOR_DEFAULTTONEAREST);
@@ -1581,10 +2237,19 @@ unsafe fn position_flyout(widget: HWND, flyout: HWND) {
     }
 
     let work = monitor_info.rcWork;
+    if multi {
+        let count = STATE
+            .get()
+            .and_then(|state| state.lock().ok())
+            .map_or(0, |state| state.saved_accounts.len());
+        let visible = panel_layout::visible_rows(count, (work.bottom - work.top) * 96 / dpi - 18);
+        PANEL_ROWS.store(visible, Ordering::Release);
+        height = panel_layout::height(visible) * dpi / 96;
+    }
+    height = height.min(work.bottom - work.top);
     width = width.min(work.right - work.left);
     let max_x = (work.right - width).max(work.left);
-    let widget_center = widget_rect.left + (widget_rect.right - widget_rect.left) / 2;
-    let x = (widget_center - width / 2).clamp(work.left, max_x);
+    let x = (widget_rect.right - width).clamp(work.left, max_x);
     let above = widget_rect.top - height - gap;
     let y = if above >= work.top {
         above
@@ -1609,6 +2274,7 @@ unsafe fn show_flyout(widget: HWND) {
     if flyout == 0 {
         return;
     }
+    trigger_saved_refresh(false);
     KillTimer(widget, TIMER_HIDE_FLYOUT);
     position_flyout(widget, flyout);
     InvalidateRect(flyout, null(), 1);
@@ -1658,11 +2324,13 @@ unsafe fn hide_flyout_if_outside() {
     let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
     let mut cursor: POINT = zeroed();
     if GetCursorPos(&mut cursor) == 0 {
+        SWITCH_MODE.store(false, Ordering::Release);
         ShowWindow(flyout, SW_HIDE);
         return;
     }
 
     if !point_inside_window(cursor, widget) && !point_inside_window(cursor, flyout) {
+        SWITCH_MODE.store(false, Ordering::Release);
         ShowWindow(flyout, SW_HIDE);
     }
 }
@@ -1695,7 +2363,7 @@ unsafe fn poll_hover(widget: HWND) {
         HOVER_TICKS.store(0, Ordering::Relaxed);
         let outside_ticks = OUTSIDE_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
         if outside_ticks >= HOVER_HIDE_TICKS && flyout != 0 && IsWindowVisible(flyout) != 0 {
-            ShowWindow(flyout, SW_HIDE);
+            hide_flyout_if_outside();
         }
     }
 }
@@ -1715,9 +2383,35 @@ unsafe fn open_usage_dashboard(hwnd: HWND) {
     ShellExecuteW(hwnd, verb.as_ptr(), url.as_ptr(), null(), null(), SW_SHOW);
 }
 
+unsafe fn show_about(hwnd: HWND) {
+    let project = env!("CARGO_PKG_REPOSITORY");
+    let message = format!(
+        "HiCodex v{}\n\nA lightweight taskbar meter for Codex limits.\n\nGitHub: {}\n\nOpen the project page?",
+        env!("CARGO_PKG_VERSION"),
+        project,
+    );
+    if MessageBoxW(
+        hwnd,
+        wide(&message).as_ptr(),
+        wide(crate::locale::text("About HiCodex")).as_ptr(),
+        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2,
+    ) == IDYES
+    {
+        ShellExecuteW(
+            hwnd,
+            wide("open").as_ptr(),
+            wide(project).as_ptr(),
+            null(),
+            null(),
+            SW_SHOW,
+        );
+    }
+}
+
 unsafe fn show_context_menu(hwnd: HWND) {
     let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
     if flyout != 0 {
+        SWITCH_MODE.store(false, Ordering::Release);
         ShowWindow(flyout, SW_HIDE);
     }
 
@@ -1726,13 +2420,14 @@ unsafe fn show_context_menu(hwnd: HWND) {
         return;
     }
 
-    let refresh = wide("Refresh now");
-    let open_usage = wide("Open Usage dashboard");
-    let startup_label = wide("Start with Windows");
-    let system_usage_label = wide("Show CPU and RAM");
-    let center_taskbar_label = wide("Center taskbar icons");
-    let acrylic_taskbar_label = wide("Acrylic taskbar");
-    let exit = wide("Exit HiCodex");
+    let refresh = wide(crate::locale::text("Refresh all"));
+    let open_usage = wide(crate::locale::text("Usage dashboard"));
+    let startup_label = wide(crate::locale::text("Start with Windows"));
+    let system_usage_label = wide(crate::locale::text("Show CPU and RAM"));
+    let center_taskbar_label = wide(crate::locale::text("Center taskbar icons"));
+
+    let about_label = wide(crate::locale::text("About HiCodex"));
+    let exit = wide(crate::locale::text("Exit HiCodex"));
 
     AppendMenuW(menu, MF_STRING, MENU_REFRESH as usize, refresh.as_ptr());
     AppendMenuW(
@@ -1743,46 +2438,66 @@ unsafe fn show_context_menu(hwnd: HWND) {
     );
     let account_choices = append_account_menu(menu);
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(
-        menu,
-        MF_STRING | if startup::is_enabled() { MF_CHECKED } else { 0 },
-        MENU_STARTUP as usize,
-        startup_label.as_ptr(),
-    );
-    AppendMenuW(
-        menu,
-        MF_STRING
-            | if SYSTEM_USAGE_ENABLED.load(Ordering::Acquire) {
-                MF_CHECKED
-            } else {
-                0
-            },
-        MENU_SYSTEM_USAGE as usize,
-        system_usage_label.as_ptr(),
-    );
-    AppendMenuW(
-        menu,
-        MF_STRING
-            | if TASKBAR_CENTERED.load(Ordering::Acquire) {
-                MF_CHECKED
-            } else {
-                0
-            },
-        MENU_CENTER_TASKBAR as usize,
-        center_taskbar_label.as_ptr(),
-    );
-    AppendMenuW(
-        menu,
-        MF_STRING
-            | if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
-                MF_CHECKED
-            } else {
-                0
-            },
-        MENU_ACRYLIC_TASKBAR as usize,
-        acrylic_taskbar_label.as_ptr(),
-    );
+    let settings = CreatePopupMenu();
+    if settings != 0 {
+        AppendMenuW(
+            settings,
+            MF_STRING | if startup::is_enabled() { MF_CHECKED } else { 0 },
+            MENU_STARTUP as usize,
+            startup_label.as_ptr(),
+        );
+        AppendMenuW(
+            settings,
+            MF_STRING
+                | if SYSTEM_USAGE_ENABLED.load(Ordering::Acquire) {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+            MENU_SYSTEM_USAGE as usize,
+            system_usage_label.as_ptr(),
+        );
+        AppendMenuW(
+            settings,
+            MF_STRING
+                | if TASKBAR_CENTERED.load(Ordering::Acquire) {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+            MENU_CENTER_TASKBAR as usize,
+            center_taskbar_label.as_ptr(),
+        );
+        let languages = CreatePopupMenu();
+        if languages != 0 {
+            for (id, label, checked) in [
+                (MENU_LANGUAGE_EN, "English", !crate::locale::is_chinese()),
+                (MENU_LANGUAGE_ZH, "简体中文", crate::locale::is_chinese()),
+            ] {
+                AppendMenuW(
+                    languages,
+                    MF_STRING | if checked { MF_CHECKED } else { 0 },
+                    id as usize,
+                    wide(label).as_ptr(),
+                );
+            }
+            AppendMenuW(settings, MF_SEPARATOR, 0, null());
+            AppendMenuW(
+                settings,
+                MF_POPUP,
+                languages as usize,
+                wide(crate::locale::text("Language")).as_ptr(),
+            );
+        }
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            settings as usize,
+            wide(crate::locale::text("Preferences")).as_ptr(),
+        );
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(menu, MF_STRING, MENU_ABOUT as usize, about_label.as_ptr());
     AppendMenuW(
         menu,
         MF_STRING
@@ -1810,10 +2525,41 @@ unsafe fn show_context_menu(hwnd: HWND) {
     DestroyMenu(menu);
 
     match command as i32 {
+        MENU_LANGUAGE_EN | MENU_LANGUAGE_ZH => {
+            if let Err(error) = crate::locale::set(command as i32 == MENU_LANGUAGE_ZH) {
+                MessageBoxW(hwnd, wide(&error).as_ptr(), wide("HiCodex").as_ptr(), MB_ICONWARNING);
+            }
+            InvalidateRect(hwnd, null(), 1);
+            let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
+            if flyout != 0 { InvalidateRect(flyout, null(), 1); }
+        }
+
+        MENU_ACCOUNT_STORAGE_ERROR => {
+            let error=ACCOUNT_STORAGE_ERROR.lock().ok().and_then(|error|error.clone()).unwrap_or_else(||"Account storage could not be read".into());
+            let home=accounts::codex_home().map(|home|home.display().to_string()).unwrap_or_else(|_|"Unknown CODEX_HOME".into());
+            MessageBoxW(hwnd,wide(&format!("{error}\n\nAccount directory: {home}\\hi-codex\n\nNo accounts were removed. If this instance was launched from a restricted development environment, quit it and start HiCodex normally from File Explorer. Do not recreate the account store or change its permissions.")).as_ptr(),wide("Account storage unavailable").as_ptr(),MB_ICONWARNING);
+        }
+        MENU_REPAIR_HISTORY => {
+            if MessageBoxW(hwnd, wide("Recover local project navigation from saved desktop account views?\n\nFully quit ChatGPT/Codex and close CLI/IDE sessions first. An encrypted checkpoint will be saved. Cloud conversations and conversation ownership will not be changed.\nReopen Codex afterward.").as_ptr(), wide("Repair local project history").as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES {
+                begin_account_action(AccountAction::RepairHistory);
+            }
+        }
         MENU_SAVE_ACCOUNT => begin_account_action(AccountAction::Save),
         MENU_SIGN_IN_ACCOUNT => begin_account_action(AccountAction::SignIn),
         MENU_CANCEL_SIGN_IN => ACCOUNT_LOGIN_CANCEL.store(true, Ordering::Release),
-        MENU_IMPORT_CODEX_AUTH => begin_account_action(AccountAction::ImportCodexAuth),
+        MENU_EXPORT_ACCOUNT => {
+            if MessageBoxW(hwnd, wide("Export saved accounts? The JSON contains login credentials. Keep it private.").as_ptr(), wide("Export JSON").as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES {
+                if let Some(path) = select_export_file(hwnd) { begin_account_action(AccountAction::Export(path)); }
+            }
+        }
+        id if id >= MENU_DELETE_FIRST && (id - MENU_DELETE_FIRST) < account_choices.len() as i32 => {
+            let index = (id - MENU_DELETE_FIRST) as usize;
+            let account = &account_choices[index];
+            let label = account.label(ACCOUNT_VISIBLE.load(Ordering::Acquire), index).replace("&&", "&");
+            if MessageBoxW(hwnd, wide(&format!("Remove {label} from saved accounts? Local chats and the current login will be kept.")).as_ptr(), wide(crate::locale::text("Remove account")).as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES {
+                begin_account_action(AccountAction::Delete(account.key.clone()));
+            }
+        }
         MENU_IMPORT_ACCOUNT => {
             if let Some(path) = select_auth_file(hwnd) {
                 begin_account_action(AccountAction::Import(path));
@@ -1836,8 +2582,9 @@ unsafe fn show_context_menu(hwnd: HWND) {
                 begin_account_action(AccountAction::Switch(account.key.clone()));
             }
         }
-        MENU_REFRESH => trigger_refresh(),
+        MENU_REFRESH => { trigger_refresh(); trigger_saved_refresh(true); },
         MENU_OPEN_USAGE => open_usage_dashboard(hwnd),
+        MENU_ABOUT => show_about(hwnd),
         MENU_STARTUP => {
             let _ = startup::set_enabled(!startup::is_enabled());
         }
@@ -1907,6 +2654,27 @@ unsafe extern "system" fn widget_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
+            let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
+            if flyout != 0 && IsWindowVisible(flyout) != 0 {
+                SWITCH_MODE.store(false, Ordering::Release);
+                ShowWindow(flyout, SW_HIDE);
+                HOVER_SUPPRESSED.store(true, Ordering::Release);
+            } else {
+                show_flyout(hwnd);
+            }
+            0
+        }
+        WM_MULTI_UPDATED => {
+            let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
+            if flyout != 0 {
+                if IsWindowVisible(flyout) != 0 {
+                    position_flyout(hwnd, flyout);
+                }
+                InvalidateRect(flyout, null(), 1);
+            }
+            0
+        }
         WM_PAINT => {
             draw_widget(hwnd);
             0
@@ -1934,6 +2702,7 @@ unsafe extern "system" fn widget_window_proc(
             OUTSIDE_TICKS.store(0, Ordering::Relaxed);
             let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
             if flyout != 0 {
+                SWITCH_MODE.store(false, Ordering::Release);
                 ShowWindow(flyout, SW_HIDE);
             }
             0
@@ -1955,26 +2724,21 @@ unsafe extern "system" fn widget_window_proc(
             0
         }
         WM_TASKBAR_LAYOUT => {
-            taskbar::acknowledge_layout_change();
-            if TASKBAR_CENTERED.load(Ordering::Acquire) {
-                position_widget(hwnd);
-                update_taskbar_centering(hwnd);
-                // One trailing pass catches delayed MSAA button geometry. This
-                // timer exists only during a layout burst, never as fast polling.
-                SetTimer(hwnd, TIMER_LAYOUT_SETTLE, 120, None);
-            }
+            refresh_taskbar_layout(hwnd, true);
+            0
+        }
+        WM_TIMER if wparam == TIMER_LAYOUT_UPDATE => {
+            refresh_taskbar_layout(hwnd, true);
             0
         }
         WM_TIMER if wparam == TIMER_LAYOUT_SETTLE => {
             KillTimer(hwnd, TIMER_LAYOUT_SETTLE);
-            if TASKBAR_CENTERED.load(Ordering::Acquire) {
-                position_widget(hwnd);
-                update_taskbar_centering(hwnd);
-            }
+            refresh_taskbar_layout(hwnd, false);
             0
         }
         WM_TIMER if wparam == TIMER_REFRESH => {
             trigger_refresh();
+            trigger_saved_refresh(false);
             0
         }
         WM_TIMER if wparam == TIMER_SYSTEM_USAGE => {
@@ -2006,7 +2770,9 @@ unsafe extern "system" fn widget_window_proc(
             0
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => {
+            taskbar::invalidate_measurement();
             position_widget(hwnd);
+            InvalidateRect(hwnd, null(), 0);
             update_taskbar_centering(hwnd);
             if TASKBAR_ACRYLIC.load(Ordering::Acquire) {
                 taskbar::apply_acrylic();
@@ -2039,8 +2805,7 @@ unsafe extern "system" fn widget_window_proc(
                         state.updated_at = None;
                     }
                 }
-                // Newly selected identities start hidden again.
-                ACCOUNT_VISIBLE.store(false, Ordering::Release);
+                // Preserve the user's visibility choice when switching accounts.
                 InvalidateRect(hwnd, null(), 1);
                 let flyout = FLYOUT_WINDOW.load(Ordering::Acquire);
                 if flyout != 0 {
@@ -2048,6 +2813,8 @@ unsafe extern "system" fn widget_window_proc(
                 }
             }
             ACCOUNT_OPERATION.store(false, Ordering::Release);
+            // Keep the current panel until the refresh reconciles saved accounts.
+            // Clearing here briefly selected the obsolete single-account flyout.
             let notice = ACCOUNT_NOTICE
                 .lock()
                 .ok()
@@ -2086,6 +2853,7 @@ unsafe extern "system" fn widget_window_proc(
             0
         }
         WM_DESTROY => {
+            ACCOUNT_OPERATION.store(true, Ordering::Release);
             ACCOUNT_LOGIN_CANCEL.store(true, Ordering::Release);
             taskbar::stop_layout_watch();
             taskbar::restore_left();
@@ -2114,10 +2882,26 @@ unsafe fn account_button_rect(hwnd: HWND) -> RECT {
     GetClientRect(hwnd, &mut bounds);
     let dpi = GetDpiForWindow(hwnd).max(96) as i32;
     RECT {
-        left: bounds.right - 44 * dpi / 96,
-        top: 183 * dpi / 96,
-        right: bounds.right - 18 * dpi / 96,
-        bottom: 207 * dpi / 96,
+        left: if multi_panel() {
+            140 * dpi / 96
+        } else {
+            bounds.right - 44 * dpi / 96
+        },
+        top: if multi_panel() {
+            bounds.bottom - 35 * dpi / 96
+        } else {
+            183 * dpi / 96
+        },
+        right: if multi_panel() {
+            232 * dpi / 96
+        } else {
+            bounds.right - 18 * dpi / 96
+        },
+        bottom: if multi_panel() {
+            bounds.bottom - 7 * dpi / 96
+        } else {
+            207 * dpi / 96
+        },
     }
 }
 
@@ -2151,11 +2935,89 @@ unsafe extern "system" fn flyout_window_proc(
                     position_flyout(WINDOW.load(Ordering::Acquire), hwnd);
                     InvalidateRect(hwnd, null(), 1);
                 }
+            } else if multi_panel() {
+                let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+                let x = (lparam as u16 as i16 as i32) * 96 / dpi;
+                let y = ((lparam >> 16) as u16 as i16 as i32) * 96 / dpi;
+                let mut bounds: RECT = zeroed();
+                GetClientRect(hwnd, &mut bounds);
+                let width = bounds.right * 96 / dpi;
+                let height = bounds.bottom * 96 / dpi;
+                if (16..124).contains(&x) && (height - 36..height - 4).contains(&y) {
+                    if !ACCOUNT_OPERATION.load(Ordering::Acquire) {
+                        SWITCH_MODE.fetch_xor(true, Ordering::AcqRel);
+                    }
+                } else if (width - 144..width - 12).contains(&x)
+                    && (height - 36..height - 4).contains(&y)
+                {
+                    trigger_saved_refresh(true);
+                    trigger_refresh();
+                } else {
+                    let count = STATE
+                        .get()
+                        .and_then(|state| state.lock().ok())
+                        .map_or(0, |state| state.saved_accounts.len());
+                    let visible = PANEL_ROWS.load(Ordering::Acquire);
+                    let offset = panel_layout::scroll_offset(
+                        ACCOUNT_SCROLL.load(Ordering::Acquire),
+                        count,
+                        visible,
+                    );
+                    if let Some(index) = panel_layout::row_at(y, offset, count, visible) {
+                        let target =
+                            STATE
+                                .get()
+                                .and_then(|state| state.lock().ok())
+                                .and_then(|state| {
+                                    state
+                                        .saved_accounts
+                                        .get(index)
+                                        .filter(|r| !r.active)
+                                        .map(|r| {
+                                            (
+                                                r.account.key.clone(),
+                                                account_usage::display_label(
+                                                    r,
+                                                    index,
+                                                    ACCOUNT_VISIBLE.load(Ordering::Acquire),
+                                                ),
+                                            )
+                                        })
+                                });
+                        if let Some((key, _label)) = target {
+                            if !ACCOUNT_OPERATION.load(Ordering::Acquire)
+                                && SWITCH_MODE.swap(false, Ordering::AcqRel)
+                            {
+                                begin_account_action(AccountAction::Switch(key));
+                            }
+                        }
+                    }
+                }
+                InvalidateRect(hwnd, null(), 1);
             }
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
             ACCOUNT_BUTTON_PRESSED.store(false, Ordering::Release);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => {
+            let count = STATE
+                .get()
+                .and_then(|state| state.lock().ok())
+                .map_or(0, |state| state.saved_accounts.len());
+            let visible = PANEL_ROWS.load(Ordering::Acquire);
+            let offset = ACCOUNT_SCROLL.load(Ordering::Acquire);
+            let next = if (wparam >> 16) as u16 as i16 > 0 {
+                offset.saturating_sub(1)
+            } else {
+                offset.saturating_add(1)
+            };
+            ACCOUNT_SCROLL.store(
+                panel_layout::scroll_offset(next, count, visible),
+                Ordering::Release,
+            );
+            InvalidateRect(hwnd, null(), 1);
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR => {
@@ -2221,14 +3083,17 @@ unsafe fn register_window_class(
 }
 
 pub fn run() {
+    crate::locale::load();
     STATE.get_or_init(|| Arc::new(Mutex::new(AppState::default())));
     TASKBAR_CENTERED.store(taskbar::preference_enabled(), Ordering::Release);
-    TASKBAR_ACRYLIC.store(taskbar::acrylic_preference_enabled(), Ordering::Release);
+    // Acrylic is retired; Windows owns taskbar appearance. Never reactivate old preferences.
+    TASKBAR_ACRYLIC.store(false, Ordering::Release);
     SYSTEM_USAGE_ENABLED.store(system_usage::preference_enabled(), Ordering::Release);
 
     unsafe {
-        taskbar::initialize();
         SetProcessDpiAwarenessContext(-4isize);
+        taskbar::load_recovery();
+        taskbar::restore_left();
 
         let instance = GetModuleHandleW(null());
         let widget_class = wide(WIDGET_CLASS_NAME);
@@ -2241,7 +3106,7 @@ pub fn run() {
 
         let title = wide("HiCodex");
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             widget_class.as_ptr(),
             title.as_ptr(),
             WS_POPUP | WS_VISIBLE,
@@ -2310,8 +3175,46 @@ pub fn run() {
 }
 
 #[cfg(test)]
-mod account_visibility_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_layout_events_are_rate_limited_without_delaying_the_first_pass() {
+        let mut gate = LayoutGate {
+            last_finished: None,
+            active: false,
+        };
+        let start = Instant::now();
+        let mut passes = 0;
+        // Ten thousand notifications per second, spread across a full minute.
+        for micros in (0..60_000_000).step_by(100) {
+            let now = start + Duration::from_micros(micros);
+            if gate.begin(now) == 0 {
+                passes += 1;
+                gate.finish(now);
+            }
+        }
+        assert_eq!(passes, 1200);
+        assert_eq!(gate.begin(start + Duration::from_secs(61)), 0);
+    }
+
+    #[test]
+    fn reentrant_layout_events_wait_for_the_active_pass_and_a_full_interval() {
+        let start = Instant::now();
+        let mut gate = LayoutGate {
+            last_finished: None,
+            active: false,
+        };
+        assert_eq!(gate.begin(start), 0);
+        assert_eq!(gate.begin(start + Duration::from_secs(10)), 50);
+        gate.finish(start + Duration::from_secs(10));
+        assert_eq!(gate.begin(start + Duration::from_secs(10)), 50);
+        assert_eq!(
+            gate.begin(start + Duration::from_millis(10_049) + Duration::from_nanos(1)),
+            1
+        );
+        assert_eq!(gate.begin(start + Duration::from_millis(10_050)), 0);
+    }
 
     #[test]
     fn hidden_account_never_exposes_identity_even_after_refresh() {
@@ -2337,5 +3240,274 @@ mod account_visibility_tests {
         assert_eq!(account_display(&account, true), "alice123@gmail.com");
         assert_eq!(account_display(&rpc::AccountSummary::default(), true), "--");
         assert!(!format!("{account:?}").contains("alice123@gmail.com"));
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetGuiResources, GetProcessHandleCount, GR_GDIOBJECTS, GR_USEROBJECTS,
+    };
+
+    #[derive(Debug)]
+    struct Resources {
+        gdi: u32,
+        user: u32,
+        handles: u32,
+        private_bytes: usize,
+    }
+
+    unsafe fn resources() -> Resources {
+        let process = GetCurrentProcess();
+        let mut memory: PROCESS_MEMORY_COUNTERS_EX = zeroed();
+        let size = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        memory.cb = size;
+        assert_ne!(
+            K32GetProcessMemoryInfo(
+                process,
+                (&mut memory as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+                size
+            ),
+            0
+        );
+        let mut handles = 0;
+        assert_ne!(GetProcessHandleCount(process, &mut handles), 0);
+        Resources {
+            gdi: GetGuiResources(process, GR_GDIOBJECTS),
+            user: GetGuiResources(process, GR_USEROBJECTS),
+            handles,
+            private_bytes: memory.PrivateUsage,
+        }
+    }
+
+    struct FixtureWindow(HWND);
+
+    impl FixtureWindow {
+        unsafe fn new(layered: bool, width: i32, height: i32) -> Self {
+            // Hidden, standalone stock windows: no taskbar parenting, hooks,
+            // timers, credential reads, background service or registry writes.
+            let hwnd = CreateWindowExW(
+                if layered { WS_EX_LAYERED } else { 0 },
+                wide("STATIC").as_ptr(),
+                wide("HiCodex graphics resource fixture").as_ptr(),
+                WS_POPUP,
+                -10_000,
+                -10_000,
+                width,
+                height,
+                0,
+                0,
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert_ne!(hwnd, 0);
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for FixtureWindow {
+        fn drop(&mut self) {
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "exports synthetic native UI previews without launching a meter or reading credentials"]
+    fn render_multi_account_panel_preview() {
+        let usage = UsageSnapshot {
+            five_hour: Some(QuotaWindow {
+                used_percent: 19.0,
+                window_duration_minutes: 300,
+                resets_at: now_unix() + 7200,
+            }),
+            weekly: Some(QuotaWindow {
+                used_percent: 38.0,
+                window_duration_minutes: 10080,
+                resets_at: now_unix() + 345600,
+            }),
+            ..Default::default()
+        };
+        let mut state = AppState {
+            usage: usage.clone(),
+            updated_at: Some(now_unix()),
+            status: Status::Ready,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            state.saved_accounts.push(account_usage::Row {
+                account: accounts::Account {
+                    key: format!("fixture-{i}::workspace"),
+                    email: format!("fixture-{i}@example.invalid"),
+                    alias: String::new(),
+                    plan: "Plus".into(),
+                },
+                active: i == 0,
+                usage: if i < 2 { Some(usage.clone()) } else { None },
+                updated_at: if i < 2 { Some(now_unix() - 180) } else { None },
+                error: if i == 2 {
+                    Some("Synthetic sign-in failure".into())
+                } else {
+                    None
+                },
+                refreshing: false,
+            });
+        }
+        state.saved_accounts[1]
+            .usage
+            .as_mut()
+            .unwrap()
+            .five_hour
+            .as_mut()
+            .unwrap()
+            .used_percent = 65.0;
+        state.saved_accounts[1]
+            .usage
+            .as_mut()
+            .unwrap()
+            .weekly
+            .as_mut()
+            .unwrap()
+            .used_percent = 10.0;
+        PANEL_ROWS.store(3, Ordering::Release);
+        ACCOUNT_VISIBLE.store(false, Ordering::Release);
+        unsafe {
+            for dpi in [96u32, 144] {
+                let width = panel_layout::WIDTH * dpi as i32 / 96;
+                let height = panel_layout::height(3) * dpi as i32 / 96;
+                let dc = CreateCompatibleDC(0);
+                let mut info: BITMAPINFO = zeroed();
+                info.bmiHeader = BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..zeroed()
+                };
+                let mut bits = null_mut();
+                let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, 0, 0);
+                assert!(dc != 0 && bitmap != 0 && !bits.is_null());
+                let old = SelectObject(dc, bitmap);
+                let bounds = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                };
+                paint_account_panel(dc, bounds, &state, dpi);
+                // Warm font fallback caches, then require no growth across 1000 paints.
+                for _ in 0..100 {
+                    paint_account_panel(dc, bounds, &state, dpi);
+                }
+                // Flush GDI batches before comparing object counts.
+                windows_sys::Win32::Graphics::Gdi::GdiFlush();
+                let baseline = resources();
+                for _ in 0..1000 {
+                    paint_account_panel(dc, bounds, &state, dpi);
+                }
+                windows_sys::Win32::Graphics::Gdi::GdiFlush();
+                let after = resources();
+                assert!(
+                    after.gdi <= baseline.gdi,
+                    "GDI baseline={} after={}",
+                    baseline.gdi,
+                    after.gdi
+                );
+                let bytes = (width * height * 4) as usize;
+                let mut output = Vec::with_capacity(bytes + 54);
+                output.extend_from_slice(b"BM");
+                output.extend_from_slice(&((bytes + 54) as u32).to_le_bytes());
+                output.extend_from_slice(&[0u8; 4]);
+                output.extend_from_slice(&54u32.to_le_bytes());
+                output.extend_from_slice(std::slice::from_raw_parts(
+                    (&info.bmiHeader as *const BITMAPINFOHEADER).cast::<u8>(),
+                    40,
+                ));
+                output.extend_from_slice(std::slice::from_raw_parts(bits.cast::<u8>(), bytes));
+                std::fs::write(format!("target/multi-account-panel-{dpi}.bmp"), output).unwrap();
+                SelectObject(dc, old);
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "graphics resource stress probe; run separately with --nocapture"]
+    fn repeated_rendering_keeps_graphics_handles_and_memory_bounded() {
+        let state = STATE.get_or_init(|| Arc::new(Mutex::new(AppState::default())));
+        *state.lock().unwrap() = AppState {
+            status: Status::Ready,
+            usage: UsageSnapshot {
+                five_hour: Some(QuotaWindow {
+                    used_percent: 25.0,
+                    window_duration_minutes: 300,
+                    resets_at: now_unix() + 3600,
+                }),
+                weekly: Some(QuotaWindow {
+                    used_percent: 50.0,
+                    window_duration_minutes: 10_080,
+                    resets_at: now_unix() + 86_400,
+                }),
+                ..Default::default()
+            },
+            account: rpc::AccountSummary {
+                email: Some("synthetic@example.invalid".to_owned()),
+                plan_type: Some("plus".to_owned()),
+            },
+            system_usage: system_usage::SystemUsage {
+                cpu_percent: Some(42),
+                memory_percent: Some(63),
+            },
+            ..Default::default()
+        };
+        SYSTEM_USAGE_ENABLED.store(true, Ordering::Release);
+        unsafe {
+            let widget = FixtureWindow::new(true, 280, 42);
+            let flyout = FixtureWindow::new(false, 400, 214);
+            let render = |cycle| {
+                ACCOUNT_VISIBLE.store(cycle % 2 == 0, Ordering::Release);
+                render_widget_layered(widget.0);
+                apply_flyout_region(flyout.0, 400, 214, 96);
+                InvalidateRect(flyout.0, null(), 0);
+                draw_flyout(flyout.0);
+                // Cover font allocation in dynamic width measurement as well.
+                assert!(widget_width(widget.0, 96) > 0);
+            };
+            // Windows initializes some process resources several seconds after
+            // the first font/window use. Both the old and refactored binaries
+            // show that delayed step; sample after a timed warmup rather than
+            // relaxing the subsequent handle-growth bound.
+            let warmup = Instant::now();
+            let mut cycle = 0;
+            while warmup.elapsed() < Duration::from_secs(10) {
+                render(cycle);
+                cycle += 1;
+            }
+            let baseline = resources();
+            println!("graphics baseline: {baseline:?}");
+            for batch in 1..=20 {
+                for cycle in 0..250 {
+                    render(cycle);
+                }
+                let current = resources();
+                println!("graphics after {} renders: {current:?}", batch * 250);
+                assert!(current.gdi <= baseline.gdi);
+                assert!(current.user <= baseline.user);
+                assert!(current.handles <= baseline.handles + 2);
+                // Allow allocator/native cache high water without accepting
+                // linear growth across thousands of complete paint cycles.
+                assert!(current.private_bytes <= baseline.private_bytes + 2 * 1024 * 1024);
+            }
+        }
+        SYSTEM_USAGE_ENABLED.store(false, Ordering::Release);
+        ACCOUNT_VISIBLE.store(false, Ordering::Release);
     }
 }
